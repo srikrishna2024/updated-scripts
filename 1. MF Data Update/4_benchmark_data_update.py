@@ -136,14 +136,26 @@ def load_initial_data(conn, data):
         return rows_inserted
 
 def incremental_update(conn, data):
+    """
+    Perform an incremental update of the benchmark data in the database.
+    This function checks the most recent date in the database and inserts any records
+    with dates more recent than that.
+    
+    Args:
+        conn (psycopg2.connection): A connection object to the PostgreSQL database.
+        data (pandas.DataFrame): A DataFrame containing the benchmark data to be inserted.
+    
+    Returns:
+        tuple: (rows_inserted, new_records_count)
+    """
     most_recent_date = get_most_recent_date(conn)
     
     if most_recent_date is not None:
-        oldest_csv_date = data['date'].min()
-        if oldest_csv_date > most_recent_date:
+        # Filter for only new records that are after the most recent date
+        new_data = data[data['date'] > most_recent_date]
+        
+        if not new_data.empty:
             rows_inserted = 0
-            new_data = data[data['date'] > most_recent_date]
-            
             with conn.cursor() as cur:
                 for _, row in new_data.iterrows():
                     cur.execute("""
@@ -162,7 +174,7 @@ def incremental_update(conn, data):
                 conn.commit()
             return rows_inserted, len(new_data)
         else:
-            return -1, 0  # Indicates that records already exist
+            return -1, 0  # No new records to insert
     else:
         # No existing records, proceed with all data
         return load_initial_data(conn, data), len(data)
