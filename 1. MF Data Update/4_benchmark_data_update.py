@@ -4,6 +4,12 @@ from datetime import datetime
 from psycopg import sql
 
 def connect_to_db():
+    """
+    Connect to the PostgreSQL database.
+
+    Returns:
+        connection object
+    """
     DB_PARAMS = {
         'dbname': 'postgres',
         'user': 'postgres',
@@ -12,6 +18,7 @@ def connect_to_db():
         'port': '5432'
     }
     return psycopg.connect(**DB_PARAMS)
+
 def get_most_recent_date(conn):
     """Get the most recent date from the benchmark table."""
     with conn.cursor() as cur:
@@ -189,44 +196,61 @@ def refresh_data(conn):
     return deleted_count
 
 def main():
-    csv_path = r"C:\Users\skchaitanya\Downloads\NIFTY.csv"
+    """
+    Main function to handle the benchmark data load.
+
+    This function:
+    1. Asks the user to choose between an initial data load, an incremental update, or refreshing the data.
+    2. If the user chooses option 1 or 2, it asks for the path of the CSV file.
+    3. Loads the CSV data into a pandas DataFrame.
+    4. Checks if the table exists in the database and creates it if not.
+    5. Based on the user's choice, calls the appropriate function to perform the operation.
+    """
     table_name = "benchmark"
 
-    try:
-        data = preprocess_csv(csv_path)
-        print(f"Date range in data: {data['date'].min().strftime('%d/%m/%Y')} to {data['date'].max().strftime('%d/%m/%Y')}")
-        total_rows = len(data)
+    print("Options:\n1. Initial Data Load\n2. Incremental Update\n3. Refresh Data")
+    choice = input("Enter your choice (1/2/3): ")
 
-        print("Options:\n1. Initial Data Load\n2. Incremental Update\n3. Refresh Data")
-        choice = input("Enter your choice (1/2/3): ")
+    if choice in ["1", "2"]:
+        csv_path = input("Enter the path of the CSV file: ")
+        try:
+            data = preprocess_csv(csv_path)
+            print(f"Date range in data: {data['date'].min().strftime('%d/%m/%Y')} to {data['date'].max().strftime('%d/%m/%Y')}")
+            total_rows = len(data)
+        except ValueError as e:
+            print(f"Error: {str(e)}")
+            return
+        except Exception as e:
+            print(f"An unexpected error occurred: {str(e)}")
+            return
+    elif choice == "3":
+        csv_path = None
+    else:
+        print("Invalid choice. Exiting.")
+        return
 
-        with connect_to_db() as conn:
-            if not check_table_exists(conn, table_name):
-                print(f"Creating table '{table_name}'...")
-                create_table_if_not_exists(conn)
-            
-            if choice == "1":
-                rows_inserted = load_initial_data(conn, data)
-                if rows_inserted == -1:
-                    print("Records already exist in the table. No new records inserted.")
-                else:
-                    print(f"Inserted {rows_inserted} of {total_rows} records.")
-            elif choice == "2":
-                rows_inserted, new_data_count = incremental_update(conn, data)
-                if rows_inserted == -1:
-                    print("Records already exist in the table. No new records inserted.")
-                else:
-                    print(f"Inserted {rows_inserted} of {new_data_count} new records.")
-            elif choice == "3":
-                deleted_count = refresh_data(conn)
-                print(f"{deleted_count} records deleted")
+    with connect_to_db() as conn:
+        if not check_table_exists(conn, table_name):
+            print(f"Creating table '{table_name}'...")
+            create_table_if_not_exists(conn)
+        
+        if choice == "1":
+            rows_inserted = load_initial_data(conn, data)
+            if rows_inserted == -1:
+                print("Records already exist in the table. No new records inserted.")
             else:
-                print("Invalid choice. Exiting.")
-    
-    except ValueError as e:
-        print(f"Error: {str(e)}")
-    except Exception as e:
-        print(f"An unexpected error occurred: {str(e)}")
+                print(f"Inserted {rows_inserted} of {total_rows} records.")
+        elif choice == "2":
+            rows_inserted, new_data_count = incremental_update(conn, data)
+            if rows_inserted == -1:
+                print("Records already exist in the table. No new records inserted.")
+            else:
+                print(f"Inserted {rows_inserted} of {new_data_count} new records.")
+        elif choice == "3":
+            deleted_count = refresh_data(conn)
+            print(f"{deleted_count} records deleted")
+        else:
+            print("Invalid choice. Exiting.")
 
 if __name__ == "__main__":
     main()
