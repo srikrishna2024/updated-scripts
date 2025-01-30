@@ -4,6 +4,7 @@ import numpy as np
 from datetime import datetime
 import psycopg
 from scipy.optimize import newton
+import plotly.express as px
 
 def connect_to_db():
     """Create database connection"""
@@ -37,6 +38,16 @@ def get_latest_nav():
                 FROM mutual_fund_nav
                 GROUP BY code
             )
+        """
+        return pd.read_sql(query, conn)
+
+def get_goal_mappings():
+    """Retrieve goal mappings from the goals table"""
+    with connect_to_db() as conn:
+        query = """
+            SELECT goal_name, investment_type, scheme_name, scheme_code, current_value
+            FROM goals
+            ORDER BY goal_name
         """
         return pd.read_sql(query, conn)
 
@@ -87,6 +98,8 @@ def calculate_portfolio_weights(df, latest_nav):
     return df
 
 def calculate_xirr(df, latest_nav):
+
+
     """
     Calculate XIRR (Extended Internal Rate of Return) for a portfolio and individual schemes.
 
@@ -149,6 +162,7 @@ def main():
 
     df = get_portfolio_data()
     latest_nav = get_latest_nav()
+    goal_mappings = get_goal_mappings()
 
     if df.empty or latest_nav.empty:
         st.warning("No data found. Please ensure portfolio data and NAV data are available.")
@@ -182,6 +196,28 @@ def main():
     # Display Portfolio Growth Over Time
     st.subheader("Portfolio Growth Over Time")
     st.line_chart(portfolio_growth_df.rename(columns={'value': 'Portfolio Value'}).set_index('date'))
+
+    # Display Goal-wise Equity and Debt Split
+    if not goal_mappings.empty:
+        st.subheader("Goal-wise Equity and Debt Split")
+        goals = goal_mappings['goal_name'].unique()
+        for goal in goals:
+            goal_data = goal_mappings[goal_mappings['goal_name'] == goal]
+            equity_value = goal_data[goal_data['investment_type'] == 'Equity']['current_value'].sum()
+            debt_value = goal_data[goal_data['investment_type'] == 'Debt']['current_value'].sum()
+            total_value = equity_value + debt_value
+
+            if total_value > 0:
+                equity_percent = (equity_value / total_value) * 100
+                debt_percent = (debt_value / total_value) * 100
+
+                fig = px.pie(values=[equity_value, debt_value], names=['Equity', 'Debt'], title=f"{goal} - Equity vs Debt Split")
+                fig.update_traces(textinfo='percent+label', pull=[0.1, 0])
+                st.plotly_chart(fig)
+
+                st.write(f"**{goal}**")
+                st.write(f"Equity: {equity_percent:.1f}%")
+                st.write(f"Debt: {debt_percent:.1f}%")
 
 if __name__ == "__main__":
     main()
