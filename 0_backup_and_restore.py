@@ -1,5 +1,6 @@
 import subprocess
 import os
+from datetime import datetime  # Import datetime module
 
 # PostgreSQL Database parameters
 DB_PARAMS = {
@@ -22,8 +23,11 @@ def create_backup():
         print("The specified folder path does not exist. Please try again.")
         return
 
-    # Define the backup filename
-    backup_file = os.path.join(backup_folder, 'database_backup.sql')
+    # Get the current date in YYYY-MM-DD format
+    current_date = datetime.now().strftime('%Y-%m-%d')
+
+    # Define the backup filename with the current date
+    backup_file = os.path.join(backup_folder, f'database_backup_{current_date}.sql')
 
     # Full path to pg_dump (adjust this to your actual PostgreSQL installation path)
     pg_dump_path = r'C:\Program Files\PostgreSQL\17\bin\pg_dump'
