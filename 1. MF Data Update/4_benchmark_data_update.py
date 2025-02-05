@@ -48,39 +48,92 @@ def create_table_if_not_exists(conn):
         conn.commit()
 
 def preprocess_csv(csv_path):
-    data = pd.read_csv(csv_path)
-    data = data.fillna(0)
-    data.columns = data.columns.str.lower().str.replace(' ', '_')
+    """
+    Preprocess CSV data with robust date parsing and error handling.
     
-    date_formats = ['%d/%m/%Y', '%m/%d/%Y', '%Y/%m/%d', '%d-%m-%Y', '%Y-%m-%d']
-    
-    for date_format in date_formats:
-        try:
-            data['date'] = pd.to_datetime(data['date'], format=date_format)
-            if not data['date'].isna().all():
-                break
-        except:
-            continue
-    
-    if data['date'].isna().all():
-        raise ValueError("Could not parse dates. Check the date format in your CSV file.")
-    
-    if data['date'].isna().any():
-        print(f"Warning: Dropping {data['date'].isna().sum()} rows with invalid dates.")
-        data = data.dropna(subset=['date'])
-
-    numeric_columns = ['price', 'open', 'high', 'low', 'vol', 'change_percent']
-    for column in numeric_columns:
-        if column in data.columns:
-            data[column] = (data[column].astype(str)
-                          .str.replace(',', '')
-                          .str.replace('%', '')
-                          .astype(float))
-        else:
-            print(f"Warning: Column '{column}' not found. Filling with 0.")
-            data[column] = 0
-    
-    return data
+    Args:
+        csv_path (str): Path to the CSV file
+        
+    Returns:
+        pandas.DataFrame: Preprocessed dataframe with correct data types
+    """
+    try:
+        # Read CSV file
+        data = pd.read_csv(csv_path)
+        data = data.fillna(0)
+        data.columns = data.columns.str.lower().str.replace(' ', '_')
+        
+        # Handle date parsing with multiple formats and error checking
+        if 'date' not in data.columns:
+            raise ValueError("CSV file must contain a 'date' column")
+            
+        # Try parsing dates with different formats
+        date_formats = ['%d/%m/%Y', '%m/%d/%Y', '%Y/%m/%d', '%d-%m-%Y', '%Y-%m-%d']
+        date_parsed = False
+        
+        for date_format in date_formats:
+            try:
+                # Convert string dates to datetime objects
+                data['date'] = pd.to_datetime(data['date'], format=date_format)
+                if not data['date'].isna().all():
+                    date_parsed = True
+                    break
+            except (ValueError, TypeError):
+                continue
+        
+        if not date_parsed:
+            # Try pandas' flexible parser as a last resort
+            try:
+                data['date'] = pd.to_datetime(data['date'])
+                date_parsed = True
+            except (ValueError, TypeError):
+                pass
+                
+        if not date_parsed:
+            raise ValueError("Could not parse dates. Please check the date format in your CSV file.")
+            
+        # Remove any rows with invalid dates
+        invalid_dates = data['date'].isna().sum()
+        if invalid_dates > 0:
+            print(f"Warning: Dropping {invalid_dates} rows with invalid dates")
+            data = data.dropna(subset=['date'])
+            
+        if len(data) == 0:
+            raise ValueError("No valid data rows remaining after date parsing")
+            
+        # Process numeric columns
+        numeric_columns = ['price', 'open', 'high', 'low', 'vol', 'change_percent']
+        for column in numeric_columns:
+            if column in data.columns:
+                # Handle various numeric formats
+                data[column] = (data[column].astype(str)
+                              .str.replace(',', '')  # Remove thousands separator
+                              .str.replace('₹', '')  # Remove rupee symbol if present
+                              .str.replace('$', '')  # Remove dollar symbol if present
+                              .str.replace('%', '')  # Remove percentage symbol
+                              .str.strip())          # Remove whitespace
+                              
+                # Convert to float, replacing invalid values with 0
+                data[column] = pd.to_numeric(data[column], errors='coerce').fillna(0)
+            else:
+                print(f"Warning: Column '{column}' not found. Creating with default value 0")
+                data[column] = 0
+                
+        # Sort by date to ensure chronological order
+        data = data.sort_values('date')
+        
+        # Verify we have valid data
+        if len(data) == 0:
+            raise ValueError("No valid data rows in CSV file")
+            
+        return data
+        
+    except pd.errors.EmptyDataError:
+        raise ValueError("The CSV file is empty")
+    except FileNotFoundError:
+        raise ValueError(f"Could not find CSV file at path: {csv_path}")
+    except Exception as e:
+        raise Exception(f"Error processing CSV file: {str(e)}")
 
 def load_initial_data(conn, data):
     """
