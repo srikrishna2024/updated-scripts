@@ -156,6 +156,7 @@ def calculate_xirr(df, latest_nav):
 
     return xirr_results, pd.DataFrame(portfolio_growth)
 
+
 def main():
     st.set_page_config(page_title="Portfolio Analysis", layout="wide")
     st.title("Portfolio Analysis Dashboard")
@@ -197,27 +198,73 @@ def main():
     st.subheader("Portfolio Growth Over Time")
     st.line_chart(portfolio_growth_df.rename(columns={'value': 'Portfolio Value'}).set_index('date'))
 
-    # Display Goal-wise Equity and Debt Split
+    # Display Goal-wise Equity and Debt Split with improved layout
     if not goal_mappings.empty:
         st.subheader("Goal-wise Equity and Debt Split")
+        
         goals = goal_mappings['goal_name'].unique()
-        for goal in goals:
-            goal_data = goal_mappings[goal_mappings['goal_name'] == goal]
-            equity_value = goal_data[goal_data['investment_type'] == 'Equity']['current_value'].sum()
-            debt_value = goal_data[goal_data['investment_type'] == 'Debt']['current_value'].sum()
-            total_value = equity_value + debt_value
+        
+        # Calculate number of rows needed (2 goals per row)
+        num_rows = (len(goals) + 1) // 2
+        
+        # Process each pair of goals
+        for row_idx in range(num_rows):
+            # Create two columns for each row
+            col1, col2 = st.columns(2)
+            
+            # Process first goal in the row
+            with col1:
+                if row_idx * 2 < len(goals):
+                    goal = goals[row_idx * 2]
+                    goal_data = goal_mappings[goal_mappings['goal_name'] == goal]
+                    equity_value = goal_data[goal_data['investment_type'] == 'Equity']['current_value'].sum()
+                    debt_value = goal_data[goal_data['investment_type'] == 'Debt']['current_value'].sum()
+                    total_value = equity_value + debt_value
 
-            if total_value > 0:
-                equity_percent = (equity_value / total_value) * 100
-                debt_percent = (debt_value / total_value) * 100
+                    if total_value > 0:
+                        equity_percent = (equity_value / total_value) * 100
+                        debt_percent = (debt_value / total_value) * 100
 
-                fig = px.pie(values=[equity_value, debt_value], names=['Equity', 'Debt'], title=f"{goal} - Equity vs Debt Split")
-                fig.update_traces(textinfo='percent+label', pull=[0.1, 0])
-                st.plotly_chart(fig)
+                        fig = px.pie(
+                            values=[equity_value, debt_value],
+                            names=['Equity', 'Debt'],
+                            title=f"{goal} - Equity vs Debt Split",
+                            height=300  # Fixed height for consistency
+                        )
+                        fig.update_traces(textinfo='percent+label', pull=[0.1, 0])
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Display percentages below the chart
+                        st.write(f"**Total Value:** ₹{total_value:,.2f}")
+                        st.write(f"**Equity:** {equity_percent:.1f}% (₹{equity_value:,.2f})")
+                        st.write(f"**Debt:** {debt_percent:.1f}% (₹{debt_value:,.2f})")
 
-                st.write(f"**{goal}**")
-                st.write(f"Equity: {equity_percent:.1f}%")
-                st.write(f"Debt: {debt_percent:.1f}%")
+            # Process second goal in the row
+            with col2:
+                if row_idx * 2 + 1 < len(goals):
+                    goal = goals[row_idx * 2 + 1]
+                    goal_data = goal_mappings[goal_mappings['goal_name'] == goal]
+                    equity_value = goal_data[goal_data['investment_type'] == 'Equity']['current_value'].sum()
+                    debt_value = goal_data[goal_data['investment_type'] == 'Debt']['current_value'].sum()
+                    total_value = equity_value + debt_value
+
+                    if total_value > 0:
+                        equity_percent = (equity_value / total_value) * 100
+                        debt_percent = (debt_value / total_value) * 100
+
+                        fig = px.pie(
+                            values=[equity_value, debt_value],
+                            names=['Equity', 'Debt'],
+                            title=f"{goal} - Equity vs Debt Split",
+                            height=300  # Fixed height for consistency
+                        )
+                        fig.update_traces(textinfo='percent+label', pull=[0.1, 0])
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Display percentages below the chart
+                        st.write(f"**Total Value:** ₹{total_value:,.2f}")
+                        st.write(f"**Equity:** {equity_percent:.1f}% (₹{equity_value:,.2f})")
+                        st.write(f"**Debt:** {debt_percent:.1f}% (₹{debt_value:,.2f})")
 
 if __name__ == "__main__":
     main()

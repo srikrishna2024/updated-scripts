@@ -132,6 +132,9 @@ def calculate_fund_xirr(transactions_df, nav_df, fund_code=None):
             else transactions_df
         )
         
+        if relevant_transactions.empty:
+            return None
+        
         # Add all investments/redemptions
         for _, row in relevant_transactions.iterrows():
             amount = row['amount']
@@ -148,10 +151,15 @@ def calculate_fund_xirr(transactions_df, nav_df, fund_code=None):
         
         if fund_code is not None:
             # Calculate for specific fund
-            latest_nav = nav_df[
+            latest_nav_data = nav_df[
                 (nav_df['date'] == latest_date) & 
                 (nav_df['code'] == fund_code)
-            ]['nav_value'].iloc[0]
+            ]
+            
+            if latest_nav_data.empty:
+                return None
+                
+            latest_nav = latest_nav_data['nav_value'].iloc[0]
             
             current_units = sum(
                 row['units'] if row['transaction_type'] in ('invest', 'switch_in')
@@ -165,18 +173,21 @@ def calculate_fund_xirr(transactions_df, nav_df, fund_code=None):
             current_value = 0
             for code in transactions_df['code'].unique():
                 fund_transactions = transactions_df[transactions_df['code'] == code]
-                fund_nav = nav_df[
+                latest_nav_data = nav_df[
                     (nav_df['date'] == latest_date) & 
                     (nav_df['code'] == code)
-                ]['nav_value'].iloc[0]
+                ]
                 
-                fund_units = sum(
-                    row['units'] if row['transaction_type'] in ('invest', 'switch_in')
-                    else -row['units']
-                    for _, row in fund_transactions.iterrows()
-                )
-                
-                current_value += fund_units * fund_nav
+                if not latest_nav_data.empty:
+                    fund_nav = latest_nav_data['nav_value'].iloc[0]
+                    
+                    fund_units = sum(
+                        row['units'] if row['transaction_type'] in ('invest', 'switch_in')
+                        else -row['units']
+                        for _, row in fund_transactions.iterrows()
+                    )
+                    
+                    current_value += fund_units * fund_nav
         
         if current_value > 0:
             cashflows.append({
@@ -184,6 +195,9 @@ def calculate_fund_xirr(transactions_df, nav_df, fund_code=None):
                 'amount': current_value
             })
         
+        if len(cashflows) < 2:  # Need at least two cash flows for XIRR
+            return None
+            
         return xirr(cashflows)
     except Exception as e:
         st.error(f"Error calculating XIRR: {str(e)}")
