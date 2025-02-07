@@ -6,6 +6,46 @@ import psycopg
 from scipy.optimize import newton
 import plotly.express as px
 
+def format_indian_number(number):
+    """
+    Format a number in Indian style (with commas for lakhs, crores)
+    Example: 10234567 becomes 1,02,34,567
+    """
+    if pd.isna(number):
+        return "0"
+    
+    number = float(number)
+    is_negative = number < 0
+    number = abs(number)
+    
+    # Convert to string with 2 decimal places
+    str_number = f"{number:,.2f}"
+    
+    # Split the decimal part
+    parts = str_number.split('.')
+    whole_part = parts[0].replace(',', '')
+    decimal_part = parts[1] if len(parts) > 1 else '00'
+    
+    # Format the whole part in Indian style
+    result = ""
+    length = len(whole_part)
+    
+    # Handle numbers less than 1000
+    if length <= 3:
+        result = whole_part
+    else:
+        # Add the last 3 digits
+        result = whole_part[-3:]
+        # Add other digits in groups of 2
+        remaining = whole_part[:-3]
+        while remaining:
+            result = (remaining[-2:] if len(remaining) >= 2 else remaining) + ',' + result
+            remaining = remaining[:-2]
+    
+    # Add decimal part and negative sign if needed
+    formatted = f"₹{'-' if is_negative else ''}{result}.{decimal_part}"
+    return formatted
+
 def connect_to_db():
     """Create database connection"""
     DB_PARAMS = {
@@ -42,12 +82,39 @@ def get_latest_nav():
         return pd.read_sql(query, conn)
 
 def get_goal_mappings():
-    """Retrieve goal mappings from the goals table"""
+    """Retrieve goal mappings from the goals table including both MF and debt investments"""
     with connect_to_db() as conn:
         query = """
+            WITH mf_latest_values AS (
+                SELECT g.goal_name, g.investment_type, g.scheme_name, g.scheme_code,
+                       CASE 
+                           WHEN g.is_manual_entry THEN g.current_value
+                           ELSE COALESCE(p.units * n.value, 0)
+                       END as current_value
+                FROM goals g
+                LEFT JOIN (
+                    SELECT scheme_name, code,
+                           SUM(CASE 
+                               WHEN transaction_type = 'switch' THEN -units
+                               WHEN transaction_type = 'redeem' THEN -units
+                               ELSE units 
+                           END) as units
+                    FROM portfolio_data
+                    GROUP BY scheme_name, code
+                ) p ON g.scheme_code = p.code
+                LEFT JOIN (
+                    SELECT code, value
+                    FROM mutual_fund_nav
+                    WHERE (code, nav) IN (
+                        SELECT code, MAX(nav)
+                        FROM mutual_fund_nav
+                        GROUP BY code
+                    )
+                ) n ON g.scheme_code = n.code
+            )
             SELECT goal_name, investment_type, scheme_name, scheme_code, current_value
-            FROM goals
-            ORDER BY goal_name
+            FROM mf_latest_values
+            ORDER BY goal_name, investment_type, scheme_name
         """
         return pd.read_sql(query, conn)
 
@@ -82,36 +149,38 @@ def xirr(transactions):
     except:
         return None
 
-def calculate_portfolio_weights(df, latest_nav):
-    """Calculate current portfolio weights for each scheme"""
-    df = df.groupby('scheme_name').agg({
+def calculate_portfolio_weights(df, latest_nav, goal_mappings):
+    """Calculate current portfolio weights for each scheme including debt investments"""
+    # First calculate MF values
+    mf_df = df.groupby('scheme_name').agg({
         'units': 'sum',
         'code': 'first'
     }).reset_index()
 
-    df = df.merge(latest_nav, on='code', how='left')
-    df['current_value'] = df['units'] * df['nav_value']
+    mf_df = mf_df.merge(latest_nav, on='code', how='left')
+    mf_df['current_value'] = mf_df['units'] * mf_df['nav_value']
 
-    total_value = df['current_value'].sum()
-    df['weight'] = (df['current_value'] / total_value) * 100 if total_value > 0 else 0
+    # Get debt investments from goal mappings, excluding any that are already in MF investments
+    debt_investments = goal_mappings[
+        (goal_mappings['investment_type'] == 'Debt') & 
+        (~goal_mappings['scheme_name'].isin(mf_df['scheme_name']))
+    ]
+    
+    # Combine MF and debt investments
+    combined_df = pd.concat([
+        mf_df[['scheme_name', 'current_value']],
+        debt_investments[['scheme_name', 'current_value']]
+    ])
 
-    return df
+    # Group by scheme_name to handle any remaining duplicates
+    combined_df = combined_df.groupby('scheme_name')['current_value'].sum().reset_index()
 
-def calculate_xirr(df, latest_nav):
+    total_value = combined_df['current_value'].sum()
+    combined_df['weight'] = (combined_df['current_value'] / total_value) * 100 if total_value > 0 else 0
 
+    return combined_df
 
-    """
-    Calculate XIRR (Extended Internal Rate of Return) for a portfolio and individual schemes.
-
-    Parameters:
-    df (pd.DataFrame): DataFrame containing transaction details with columns 'scheme_name', 'date', 'units', 'cashflow', and 'code'.
-    latest_nav (pd.DataFrame): DataFrame containing the latest NAV values with columns 'code' and 'nav_value'.
-
-    Returns:
-    tuple: A tuple containing:
-        - xirr_results (dict): A dictionary with scheme names as keys and their respective XIRR values as values. The key 'Portfolio' contains the overall portfolio XIRR.
-        - portfolio_growth (pd.DataFrame): A DataFrame with columns 'date' and 'value' representing the portfolio value growth over time.
-    """
+def calculate_xirr(df, latest_nav, goal_mappings):
     """Calculate XIRR for portfolio and individual schemes"""
     schemes = df['scheme_name'].unique()
     xirr_results = {}
@@ -137,7 +206,11 @@ def calculate_xirr(df, latest_nav):
         transactions_up_to_date = df[df['date'] <= date].copy()
         transactions_up_to_date = transactions_up_to_date.merge(latest_nav, on='code', how='left')
         transactions_up_to_date['current_value'] = transactions_up_to_date['units'] * transactions_up_to_date['nav_value']
-        total_value_on_date = transactions_up_to_date['current_value'].sum()
+        
+        # Include debt investments in the portfolio value
+        debt_value_on_date = goal_mappings[goal_mappings['investment_type'] == 'Debt']['current_value'].sum()
+        total_value_on_date = transactions_up_to_date['current_value'].sum() + debt_value_on_date
+        
         portfolio_growth.append({'date': date, 'value': total_value_on_date})
 
     # Calculate overall portfolio XIRR
@@ -145,17 +218,36 @@ def calculate_xirr(df, latest_nav):
     if not total_transactions.empty:
         total_transactions = total_transactions.merge(latest_nav, on='code', how='left')
         total_transactions['current_value'] = total_transactions['units'] * total_transactions['nav_value']
+        
+        # Include debt investments in the final portfolio value
+        debt_final_value = goal_mappings[goal_mappings['investment_type'] == 'Debt']['current_value'].sum()
         portfolio_final_value = pd.DataFrame({
             'date': [datetime.now()],
-            'cashflow': [total_transactions['current_value'].sum()]
+            'cashflow': [total_transactions['current_value'].sum() + debt_final_value]
         })
+        
         total_cashflow = total_transactions[['date', 'cashflow']]
         total_transactions = pd.concat([total_cashflow, portfolio_final_value])
         portfolio_xirr = xirr(total_transactions)
         xirr_results['Portfolio'] = round(portfolio_xirr * 100, 1) if portfolio_xirr is not None else 0
 
-    return xirr_results, pd.DataFrame(portfolio_growth)
+    # Calculate Mutual Fund Portfolio XIRR (excluding debt investments)
+    mf_transactions = df.copy()
+    if not mf_transactions.empty:
+        mf_transactions = mf_transactions.merge(latest_nav, on='code', how='left')
+        mf_transactions['current_value'] = mf_transactions['units'] * mf_transactions['nav_value']
+        
+        mf_final_value = pd.DataFrame({
+            'date': [datetime.now()],
+            'cashflow': [mf_transactions['current_value'].sum()]
+        })
+        
+        mf_cashflow = mf_transactions[['date', 'cashflow']]
+        mf_transactions = pd.concat([mf_cashflow, mf_final_value])
+        mf_xirr = xirr(mf_transactions)
+        xirr_results['Mutual Fund Portfolio'] = round(mf_xirr * 100, 1) if mf_xirr is not None else 0
 
+    return xirr_results, pd.DataFrame(portfolio_growth)
 
 def main():
     st.set_page_config(page_title="Portfolio Analysis", layout="wide")
@@ -173,46 +265,74 @@ def main():
     df = prepare_cashflows(df)
 
     # Calculate XIRR and Portfolio Growth
-    xirr_results, portfolio_growth_df = calculate_xirr(df, latest_nav)
+    xirr_results, portfolio_growth_df = calculate_xirr(df, latest_nav, goal_mappings)
 
-    # Calculate portfolio weights
-    weights_df = calculate_portfolio_weights(df, latest_nav)
+    # Calculate portfolio weights including debt investments
+    weights_df = calculate_portfolio_weights(df, latest_nav, goal_mappings)
 
-    # Display Overall Portfolio Metrics
+    # Calculate equity and debt values
+    equity_value = weights_df[weights_df['scheme_name'].isin(df['scheme_name'].unique())]['current_value'].sum()
+    debt_value = goal_mappings[goal_mappings['investment_type'] == 'Debt']['current_value'].sum()
+    total_portfolio_value = equity_value + debt_value
+
+    equity_percent = (equity_value / total_portfolio_value) * 100 if total_portfolio_value > 0 else 0
+    debt_percent = (debt_value / total_portfolio_value) * 100 if total_portfolio_value > 0 else 0
+
+    # Calculate total invested amount
+    mf_invested = df[df['transaction_type'] == 'invest']['amount'].sum()
+    debt_invested = goal_mappings[goal_mappings['investment_type'] == 'Debt']['current_value'].sum()
+    total_invested = mf_invested + debt_invested
+
+    # Display Overall Portfolio Metrics - 2 metrics per row
     st.subheader("Overall Portfolio Metrics")
+    
+    # Row 1: Mutual Fund Portfolio XIRR and Current Portfolio Value
     col1, col2 = st.columns(2)
     with col1:
-        st.metric("Portfolio XIRR", f"{xirr_results['Portfolio']:.1f}%")
+        st.metric("Mutual Fund Portfolio XIRR", f"{xirr_results['Mutual Fund Portfolio']:.1f}%")
     with col2:
-        st.metric("Current Portfolio Value", f"{weights_df['current_value'].sum():,.2f}")
-
-    st.metric("Total Invested Amount", f"{df[df['transaction_type'] == 'invest']['amount'].sum():,.2f}")
+        st.metric("Current Portfolio Value ( including EPF and PPF )", format_indian_number(total_portfolio_value))
+    
+    # Row 2: Equity and Debt Values
+    col3, col4 = st.columns(2)
+    with col3:
+        st.metric("Equity Mutual Funds", f"{format_indian_number(equity_value)} ({equity_percent:.1f}%)")
+    with col4:
+        st.metric("Debt Funds along with EPF and PPF", f"{format_indian_number(debt_value)} ({debt_percent:.1f}%)")
+    
+    # Row 3: Total Invested Amount (centered in one column)
+    col5, col6 = st.columns(2)
+    with col5:
+        st.metric("Total Invested Amount", format_indian_number(total_invested))
 
     # Display Individual Scheme Metrics
     st.subheader("Individual Fund Metrics")
-    fund_metrics = weights_df[['scheme_name', 'current_value', 'weight']]
+    fund_metrics = weights_df[['scheme_name', 'current_value', 'weight']].copy()
+    fund_metrics['Current Value'] = fund_metrics['current_value'].apply(format_indian_number)
+    fund_metrics['Weight (%)'] = fund_metrics['weight'].round(2)
     fund_metrics['XIRR (%)'] = fund_metrics['scheme_name'].map(xirr_results)
-    st.dataframe(fund_metrics)
+    
+    # Display formatted columns
+    display_metrics = fund_metrics[['scheme_name', 'Current Value', 'Weight (%)', 'XIRR (%)']]
+    display_metrics.columns = ['Scheme Name', 'Current Value', 'Weight (%)', 'XIRR (%)']
+    st.dataframe(display_metrics)
 
     # Display Portfolio Growth Over Time
     st.subheader("Portfolio Growth Over Time")
-    st.line_chart(portfolio_growth_df.rename(columns={'value': 'Portfolio Value'}).set_index('date'))
+    growth_chart_df = portfolio_growth_df.copy()
+    growth_chart_df['value'] = growth_chart_df['value'].round(2)
+    st.line_chart(growth_chart_df.rename(columns={'value': 'Portfolio Value'}).set_index('date'))
 
-    # Display Goal-wise Equity and Debt Split with improved layout
+    # Display Goal-wise Equity and Debt Split
     if not goal_mappings.empty:
         st.subheader("Goal-wise Equity and Debt Split")
         
         goals = goal_mappings['goal_name'].unique()
-        
-        # Calculate number of rows needed (2 goals per row)
         num_rows = (len(goals) + 1) // 2
         
-        # Process each pair of goals
         for row_idx in range(num_rows):
-            # Create two columns for each row
             col1, col2 = st.columns(2)
             
-            # Process first goal in the row
             with col1:
                 if row_idx * 2 < len(goals):
                     goal = goals[row_idx * 2]
@@ -229,17 +349,15 @@ def main():
                             values=[equity_value, debt_value],
                             names=['Equity', 'Debt'],
                             title=f"{goal} - Equity vs Debt Split",
-                            height=300  # Fixed height for consistency
+                            height=300
                         )
                         fig.update_traces(textinfo='percent+label', pull=[0.1, 0])
                         st.plotly_chart(fig, use_container_width=True)
                         
-                        # Display percentages below the chart
-                        st.write(f"**Total Value:** ₹{total_value:,.2f}")
-                        st.write(f"**Equity:** {equity_percent:.1f}% (₹{equity_value:,.2f})")
-                        st.write(f"**Debt:** {debt_percent:.1f}% (₹{debt_value:,.2f})")
+                        st.write(f"**Total Value:** {format_indian_number(total_value)}")
+                        st.write(f"**Equity:** {equity_percent:.1f}% ({format_indian_number(equity_value)})")
+                        st.write(f"**Debt:** {debt_percent:.1f}% ({format_indian_number(debt_value)})")
 
-            # Process second goal in the row
             with col2:
                 if row_idx * 2 + 1 < len(goals):
                     goal = goals[row_idx * 2 + 1]
@@ -256,15 +374,14 @@ def main():
                             values=[equity_value, debt_value],
                             names=['Equity', 'Debt'],
                             title=f"{goal} - Equity vs Debt Split",
-                            height=300  # Fixed height for consistency
+                            height=300
                         )
                         fig.update_traces(textinfo='percent+label', pull=[0.1, 0])
                         st.plotly_chart(fig, use_container_width=True)
                         
-                        # Display percentages below the chart
-                        st.write(f"**Total Value:** ₹{total_value:,.2f}")
-                        st.write(f"**Equity:** {equity_percent:.1f}% (₹{equity_value:,.2f})")
-                        st.write(f"**Debt:** {debt_percent:.1f}% (₹{debt_value:,.2f})")
+                        st.write(f"**Total Value:** {format_indian_number(total_value)}")
+                        st.write(f"**Equity:** {equity_percent:.1f}% ({format_indian_number(equity_value)})")
+                        st.write(f"**Debt:** {debt_percent:.1f}% ({format_indian_number(debt_value)})")
 
 if __name__ == "__main__":
     main()

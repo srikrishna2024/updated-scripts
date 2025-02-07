@@ -3,6 +3,7 @@ import pandas as pd
 import psycopg
 from io import StringIO
 import tempfile
+from datetime import datetime
 
 # Database connection parameters from the existing script
 DB_PARAMS = {
@@ -49,35 +50,85 @@ def clean_numeric_data(df):
     
     return df
 
+def convert_date_format(df):
+    """Convert date from MM/DD/YYYY to YYYY-MM-DD format"""
+    try:
+        # Convert date strings to datetime objects and then to desired format
+        df['Date'] = pd.to_datetime(df['Date'], format='%m/%d/%Y').dt.strftime('%Y-%m-%d')
+        # Convert back to datetime.date objects for database compatibility
+        df['Date'] = pd.to_datetime(df['Date']).dt.date
+        return df
+    except Exception as e:
+        raise Exception(f"Error converting date format: {str(e)}")
+
+def standardize_column_names(df):
+    """Standardize column names to expected format"""
+    # Create a mapping of possible variations to standard names
+    column_mapping = {
+        'date': 'Date',
+        'scheme_name': 'scheme_name',
+        'code': 'code',
+        'transaction_type': 'Transaction Type',
+        'transaction': 'Transaction Type',
+        'type': 'Transaction Type',
+        'value': 'value',
+        'units': 'units',
+        'amount': 'amount'
+    }
+    
+    # Convert column names to lowercase for case-insensitive matching
+    df.columns = [col.lower().strip() for col in df.columns]
+    
+    # Rename columns based on mapping
+    df = df.rename(columns=column_mapping)
+    
+    return df
+
 def validate_dataframe(df):
     """Validate the uploaded dataframe format and data"""
-    required_columns = ['Date', 'scheme_name', 'code', 'Transaction Type', 'value', 'units', 'amount']
-    
-    # Check if all required columns exist
-    if not all(col in df.columns for col in required_columns):
-        missing_cols = [col for col in required_columns if col not in df.columns]
-        return False, f"Missing columns: {', '.join(missing_cols)}"
-    
-    # Check transaction types
-    valid_types = {'invest', 'switch', 'redeem'}
-    invalid_types = set(df['Transaction Type'].unique()) - valid_types
-    if invalid_types:
-        return False, f"Invalid transaction types found: {', '.join(invalid_types)}. Allowed types: invest, switch, redeem"
-    
-    # Clean and validate numeric data
     try:
-        df = clean_numeric_data(df)
+        # Standardize column names
+        df = standardize_column_names(df)
         
-        # Check for any remaining NaN values in numeric columns
-        numeric_columns = ['value', 'units', 'amount']
-        for col in numeric_columns:
-            if df[col].isna().any():
-                invalid_rows = df[df[col].isna()].index.tolist()
-                return False, f"Invalid numeric values found in {col} column at rows: {invalid_rows}"
+        required_columns = ['Date', 'scheme_name', 'code', 'Transaction Type', 'value', 'units', 'amount']
         
-        return True, "Validation successful", df
+        # Check if all required columns exist
+        if not all(col in df.columns for col in required_columns):
+            missing_cols = [col for col in required_columns if col not in df.columns]
+            return False, f"Missing columns: {', '.join(missing_cols)}", None
+
+        # Convert date format
+        try:
+            df = convert_date_format(df)
+        except Exception as e:
+            return False, f"Date format error: {str(e)}", None
+        
+        # Check transaction types
+        valid_types = {'invest', 'switch', 'redeem'}
+        invalid_types = set(df['Transaction Type'].str.lower().unique()) - valid_types
+        if invalid_types:
+            return False, f"Invalid transaction types found: {', '.join(invalid_types)}. Allowed types: invest, switch, redeem", None
+        
+        # Standardize transaction types to lowercase
+        df['Transaction Type'] = df['Transaction Type'].str.lower()
+        
+        # Clean and validate numeric data
+        try:
+            df = clean_numeric_data(df)
+            
+            # Check for any remaining NaN values in numeric columns
+            numeric_columns = ['value', 'units', 'amount']
+            for col in numeric_columns:
+                if df[col].isna().any():
+                    invalid_rows = df[df[col].isna()].index.tolist()
+                    return False, f"Invalid numeric values found in {col} column at rows: {invalid_rows}", None
+            
+            return True, "Validation successful", df
+        except Exception as e:
+            return False, f"Error processing numeric data: {str(e)}", None
+            
     except Exception as e:
-        return False, f"Error processing numeric data: {str(e)}", None
+        return False, f"Error validating dataframe: {str(e)}", None
 
 def insert_portfolio_data(df):
     """Insert validated data into portfolio_data table"""
@@ -116,21 +167,25 @@ def get_portfolio_data():
         """
         return pd.read_sql(query, conn)
 
+def download_portfolio_data(df, file_format):
+    """Generate downloadable file from portfolio data"""
+    if df.empty:
+        return None
+    
+    if file_format == 'CSV':
+        # Convert DataFrame to CSV
+        csv = df.to_csv(index=False)
+        return csv.encode('utf-8')
+    else:  # XLSX
+        # Create Excel file in memory
+        output = StringIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False, sheet_name='Portfolio Data')
+        return output.getvalue()
+
 def main():
     """
     Main function to handle the Portfolio Transaction Upload page.
-    This function sets up the Streamlit page configuration, handles file uploads,
-    validates and processes the uploaded data, and displays the current portfolio data.
-    Steps:
-    1. Set up the Streamlit page configuration and title.
-    2. Create the portfolio table if it doesn't exist.
-    3. Provide a file uploader for CSV or Excel files.
-    4. Read and process the uploaded file.
-    5. Validate the data and show a preview.
-    6. Insert the validated data into the database upon user confirmation.
-    7. Display the current portfolio data from the database.
-    Raises:
-        Exception: If there is an error processing the uploaded file or inserting data into the database.
     """
     st.set_page_config(page_title='Portfolio Transaction Upload', layout='wide')
     st.title('Portfolio Transaction Upload')
@@ -140,6 +195,17 @@ def main():
     
     # File upload section
     st.subheader('Upload Transaction Data')
+    st.info("""
+    Expected columns and formats:
+    - Date: MM/DD/YYYY format (e.g., 01/31/2024)
+    - scheme_name: Name of the scheme
+    - code: Scheme code
+    - Transaction Type: 'invest', 'switch', or 'redeem'
+    - value: Numeric value
+    - units: Number of units
+    - amount: Transaction amount
+    """)
+    
     uploaded_file = st.file_uploader("Choose a CSV or Excel file", type=['csv', 'xlsx'])
     
     if uploaded_file is not None:
@@ -150,14 +216,15 @@ def main():
             else:
                 df = pd.read_excel(uploaded_file)
             
-            # Convert date column to datetime
-            df['Date'] = pd.to_datetime(df['Date']).dt.date
+            # Show raw data
+            st.subheader('Raw Data Preview')
+            st.dataframe(df)
             
             # Validate data
             is_valid, message, cleaned_df = validate_dataframe(df)
             
-            # Show preview of the data
-            st.subheader('Data Preview')
+            # Show preview of the processed data
+            st.subheader('Processed Data Preview')
             if is_valid:
                 st.success(message)
                 st.dataframe(cleaned_df)
@@ -171,7 +238,6 @@ def main():
                         st.error(f'Error inserting data: {str(e)}')
             else:
                 st.error(message)
-                st.dataframe(df)
                 
         except Exception as e:
             st.error(f'Error processing file: {str(e)}')
@@ -181,6 +247,27 @@ def main():
     portfolio_data = get_portfolio_data()
     if not portfolio_data.empty:
         st.dataframe(portfolio_data)
+        
+        # Download section
+        st.subheader('Download Portfolio Data')
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            file_format = st.selectbox('Select Format', ['CSV', 'XLSX'])
+        with col2:
+            if st.button('Download Data'):
+                file_data = download_portfolio_data(portfolio_data, file_format)
+                
+                if file_data is not None:
+                    file_extension = 'csv' if file_format == 'CSV' else 'xlsx'
+                    file_name = f'portfolio_data.{file_extension}'
+                    
+                    # Create download button
+                    st.download_button(
+                        label=f"Click here to download {file_format}",
+                        data=file_data,
+                        file_name=file_name,
+                        mime='text/csv' if file_format == 'CSV' else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                    )
     else:
         st.info('No records found in the database. Please upload a file to add data.')
 
