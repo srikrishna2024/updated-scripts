@@ -77,6 +77,27 @@ def get_fund_metrics(category):
         return df
 
 def main():
+    """
+    Main function to run the Mutual Fund Category Screener application.
+    This function sets up the Streamlit page configuration, displays the title,
+    and provides a sidebar for user inputs. It allows users to select a mutual
+    fund category, choose sorting options, and analyze the selected category.
+    The results are displayed in a table format, and users can download the
+    results as a CSV file. Additionally, summary statistics for the selected
+    category are displayed.
+    Sidebar Inputs:
+        - Select Mutual Fund Category: Dropdown to select the mutual fund category.
+        - Sort By: Dropdown to select the column to sort by.
+        - Sort Order: Dropdown to select the sort order (Ascending/Descending).
+        - Analyze Category: Button to trigger the analysis.
+    Displays:
+        - Screening Results: A table of the mutual funds in the selected category,
+          sorted based on the selected criteria.
+        - Download Results as CSV: Button to download the screening results as a CSV file.
+        - Category Summary: A table displaying summary statistics for the selected category.
+    Raises:
+        - Displays an error message if no data is found for the selected category.
+    """
     st.set_page_config(page_title='Mutual Fund Category Screener', layout='wide')
     st.title('Mutual Fund Category Screener')
 
