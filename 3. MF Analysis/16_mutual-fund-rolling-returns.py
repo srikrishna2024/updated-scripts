@@ -28,7 +28,7 @@ def get_fund_list():
         df = pd.read_sql(query, conn)
         return df
 
-def get_fund_nav_data(code):
+def get_fund_nav_data(code, scheme_name):
     """Fetch historical NAV data for a specific fund"""
     with connect_to_db() as conn:
         query = """
@@ -40,6 +40,8 @@ def get_fund_nav_data(code):
         df = pd.read_sql(query, conn, params=(code,))
         df['nav'] = pd.to_datetime(df['nav'])
         df['value'] = df['value'].astype(float)
+        # Store the scheme name as a column instead of DataFrame attribute
+        df['scheme_name'] = scheme_name
         return df
 
 def get_benchmark_data():
@@ -59,6 +61,10 @@ def calculate_rolling_returns(df, period_years):
     """Calculate rolling CAGR for a given period"""
     df = df.copy()
     df.set_index('date', inplace=True)
+    
+    # Drop duplicate dates if any
+    df = df[~df.index.duplicated(keep='first')]
+    
     df = df.resample('D').ffill()  # Fill missing dates with the last available value
     periods = int(365 * period_years)  # Ensure periods is an integer
     rolling_returns = df['value'].pct_change(periods=periods)  # Calculate rolling returns
@@ -69,13 +75,17 @@ def calculate_benchmark_rolling_returns(df, period_years):
     """Calculate rolling CAGR for benchmark data"""
     df = df.copy()
     df.set_index('date', inplace=True)
+    
+    # Drop duplicate dates if any
+    df = df[~df.index.duplicated(keep='first')]
+    
     df = df.resample('D').ffill()  # Fill missing dates with the last available value
     periods = int(365 * period_years)  # Ensure periods is an integer
     rolling_returns = df['price'].pct_change(periods=periods)  # Calculate rolling returns
     rolling_cagr = (1 + rolling_returns) ** (1 / period_years) - 1  # Convert to CAGR
     return rolling_cagr.dropna()
 
-def plot_rolling_returns(fund_data, benchmark_data, period_name, period_years):
+def plot_rolling_returns(fund_data, benchmark_data, period_name, period_years, scheme_name):
     """Plot rolling returns for a given period"""
     # Calculate rolling returns for the fund
     fund_rolling_cagr = calculate_rolling_returns(
@@ -90,11 +100,11 @@ def plot_rolling_returns(fund_data, benchmark_data, period_name, period_years):
 
     # Plot rolling returns
     plt.figure(figsize=(10, 4))
-    plt.plot(fund_rolling_cagr.index, fund_rolling_cagr * 100, label=f'{fund_data.name} Rolling CAGR', color='blue')
+    plt.plot(fund_rolling_cagr.index, fund_rolling_cagr * 100, label=f'{scheme_name} Rolling CAGR', color='blue')
     plt.plot(benchmark_rolling_cagr.index, benchmark_rolling_cagr * 100, label='Benchmark Rolling CAGR', color='orange')
     plt.xlabel('Start Date of Rolling Period')
     plt.ylabel('CAGR (%)')
-    plt.title(f'{period_name} Rolling Returns: {fund_data.name} vs Benchmark')
+    plt.title(f'{period_name} Rolling Returns: {scheme_name} vs Benchmark')
     plt.legend()
     plt.grid(True)
     st.pyplot(plt)
@@ -119,7 +129,7 @@ def main():
         if analyze_button:
             with st.spinner('Analyzing fund and benchmark rolling returns...'):
                 # Fetch historical NAV data for the selected fund
-                fund_nav_data = get_fund_nav_data(selected_code)
+                fund_nav_data = get_fund_nav_data(selected_code, selected_fund)
                 if fund_nav_data.empty:
                     st.error('No data found for the selected fund.')
                     return
@@ -141,7 +151,7 @@ def main():
 
                 # Calculate and plot rolling returns for each period
                 for period_name, period_years in periods.items():
-                    plot_rolling_returns(fund_nav_data, benchmark_data, period_name, period_years)
+                    plot_rolling_returns(fund_nav_data, benchmark_data, period_name, period_years, selected_fund)
 
     with tab2:
         st.header("Compare 3 Funds vs Benchmark")
@@ -179,12 +189,11 @@ def main():
                 fund_data_list = []
                 for fund_name in selected_funds:
                     fund_code = fund_list[fund_list['scheme_name'] == fund_name]['code'].values[0]
-                    fund_nav_data = get_fund_nav_data(fund_code)
+                    fund_nav_data = get_fund_nav_data(fund_code, fund_name)
                     if fund_nav_data.empty:
                         st.error(f'No data found for the selected fund: {fund_name}.')
                         return
-                    fund_nav_data.name = fund_name  # Add fund name to the DataFrame for labeling
-                    fund_data_list.append(fund_nav_data)
+                    fund_data_list.append((fund_nav_data, fund_name))
 
                 # Calculate and plot rolling returns for each period
                 for period_name, period_years in periods.items():
@@ -194,12 +203,12 @@ def main():
                     plt.plot(benchmark_rolling_cagr.index, benchmark_rolling_cagr * 100, label='Benchmark Rolling CAGR', color='orange')
 
                     # Plot rolling returns for each fund
-                    for fund_data in fund_data_list:
+                    for fund_data, fund_name in fund_data_list:
                         fund_rolling_cagr = calculate_rolling_returns(
                             fund_data.rename(columns={'nav': 'date', 'value': 'value'}),
                             period_years
                         )
-                        plt.plot(fund_rolling_cagr.index, fund_rolling_cagr * 100, label=f'{fund_data.name} Rolling CAGR')
+                        plt.plot(fund_rolling_cagr.index, fund_rolling_cagr * 100, label=f'{fund_name} Rolling CAGR')
 
                     plt.xlabel('Start Date of Rolling Period')
                     plt.ylabel('CAGR (%)')
