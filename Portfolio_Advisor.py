@@ -2,9 +2,8 @@ import streamlit as st
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 
-
-def get_asset_allocation(age, risk_appetite):
-    """Dynamically adjust asset allocation based on age and risk appetite, keeping retirement age at 60."""
+def get_asset_allocation(age, risk_appetite, include_gold):
+    """Dynamically adjust asset allocation based on age, risk appetite, and whether to include gold, keeping retirement age at 60."""
     if age < 40:
         allocation = {'Equity': 70, 'Debt': 20, 'Gold': 10} if risk_appetite == 'Aggressive' else \
                      {'Equity': 60, 'Debt': 30, 'Gold': 10} if risk_appetite == 'Moderate' else \
@@ -21,6 +20,13 @@ def get_asset_allocation(age, risk_appetite):
         allocation = {'Equity': 30, 'Debt': 60, 'Gold': 10} if risk_appetite == 'Aggressive' else \
                      {'Equity': 20, 'Debt': 70, 'Gold': 10} if risk_appetite == 'Moderate' else \
                      {'Equity': 10, 'Debt': 80, 'Gold': 10}
+    
+    if not include_gold:
+        total = allocation['Equity'] + allocation['Debt']
+        allocation['Equity'] = round((allocation['Equity'] / total) * 100, 2)
+        allocation['Debt'] = round((allocation['Debt'] / total) * 100, 2)
+        del allocation['Gold']
+    
     return allocation
 
 # Streamlit App UI
@@ -30,13 +36,14 @@ st.write("Smart asset allocation based on your age & risk appetite, with retirem
 # User Inputs
 age = st.slider("Select your age:", 18, 60, 30)
 risk_appetite = st.selectbox("Select your risk appetite:", ["Conservative", "Moderate", "Aggressive"])
+include_gold = st.checkbox("Include Gold in Portfolio")
 
 # Plot Asset Allocation Over Time
 st.subheader("📈 Changing Asset Allocation Over Time (Retirement at 60)")
 age_range = list(range(age, 61))
-allocation_over_time = {key: [] for key in ['Equity', 'Debt', 'Gold']}
+allocation_over_time = {key: [] for key in ['Equity', 'Debt', 'Gold'] if include_gold or key != 'Gold'}
 for a in age_range:
-    alloc = get_asset_allocation(a, risk_appetite)
+    alloc = get_asset_allocation(a, risk_appetite, include_gold)
     for key in alloc:
         allocation_over_time[key].append(alloc[key])
 
