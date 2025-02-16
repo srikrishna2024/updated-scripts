@@ -68,13 +68,13 @@ def preprocess_csv(csv_path):
             raise ValueError("CSV file must contain a 'date' column")
             
         # Try parsing dates with different formats
-        date_formats = ['%d/%m/%Y', '%m/%d/%Y', '%Y/%m/%d', '%d-%m-%Y', '%Y-%m-%d']
+        date_formats = ['%d-%m-%Y', '%d/%m/%Y', '%m/%d/%Y', '%Y/%m/%d', '%Y-%m-%d']
         date_parsed = False
         
         for date_format in date_formats:
             try:
                 # Convert string dates to datetime objects
-                data['date'] = pd.to_datetime(data['date'], format=date_format)
+                data['date'] = pd.to_datetime(data['date'], format=date_format, dayfirst=True)
                 if not data['date'].isna().all():
                     date_parsed = True
                     break
@@ -84,7 +84,7 @@ def preprocess_csv(csv_path):
         if not date_parsed:
             # Try pandas' flexible parser as a last resort
             try:
-                data['date'] = pd.to_datetime(data['date'])
+                data['date'] = pd.to_datetime(data['date'], dayfirst=True)
                 date_parsed = True
             except (ValueError, TypeError):
                 pass
