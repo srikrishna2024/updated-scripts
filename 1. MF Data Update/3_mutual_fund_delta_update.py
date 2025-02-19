@@ -5,6 +5,11 @@ import os
 
 LOG_FILE = "nav_update_log.txt"
 
+def clear_log():
+    """Clears the log file."""
+    with open(LOG_FILE, "w") as file:
+        file.write("")
+
 def write_log(message):
     """Writes a message to the log file."""
     with open(LOG_FILE, "a") as file:
@@ -75,8 +80,8 @@ def update_nav_data(cursor, schemes):
                     ON CONFLICT ON CONSTRAINT unique_code_nav DO NOTHING;
                 """, (scheme_code, scheme_name, nav_date, nav_value))
                 updated_records += 1
-            print(f"Updated {updated_records} records for scheme: {scheme_name}")
-            write_log(f"Updated {updated_records} records for scheme: {scheme_name}")
+            print(f"Updated {updated_records} records for scheme: {scheme_name} (Code: {scheme_code})")
+            write_log(f"Updated {updated_records} records for scheme: {scheme_name} (Code: {scheme_code})")
             total_updated += updated_records
         else:
             print(f"No NAV data found for scheme {scheme_code}.")
@@ -105,6 +110,9 @@ def nav_recent_updater(db_config):
     - The function uses the `psycopg` library to connect to the PostgreSQL database.
     """
     try:
+        # Clear the log file at the beginning
+        clear_log()
+
         # Connect to the PostgreSQL database
         with psycopg.connect(
             dbname=db_config['dbname'],
