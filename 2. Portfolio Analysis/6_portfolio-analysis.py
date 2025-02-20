@@ -141,6 +141,9 @@ def xirr(transactions):
     def xnpv_der(rate):
         first_date = pd.to_datetime(transactions['date'].min())
         days = [(pd.to_datetime(date) - first_date).days for date in transactions['date']]
+        # Ensure rate is valid to avoid invalid power operations
+        if (1 + rate) <= 0:
+            return np.inf  # Return a large value to avoid invalid rates
         return sum([cf * (-d/365.0) * (1 + rate) ** (-d/365.0 - 1) 
                     for cf, d in zip(transactions['cashflow'], days)])
 
