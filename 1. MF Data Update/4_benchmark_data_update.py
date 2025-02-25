@@ -47,7 +47,22 @@ def create_table_if_not_exists(conn):
         """)
         conn.commit()
 
+def reset_sequence(conn):
+    """Reset the id sequence to the max id + 1 in the benchmark table."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT setval('benchmark_id_seq', COALESCE((SELECT MAX(id) FROM benchmark), 0) + 1, false)
+        """)
+        conn.commit()
+
 def preprocess_csv(csv_path):
+    Raises:
+        ValueError: If the CSV file does not contain a 'date' column, 
+                    if dates cannot be parsed, 
+                    if no valid data rows remain after date parsing,
+                    if the CSV file is empty,
+                    or if the CSV file cannot be found.
+        Exception: For any other errors encountered during processing.
     """
     Preprocess CSV data with robust date parsing and error handling.
     
@@ -142,10 +157,12 @@ def load_initial_data(conn, data):
     It first checks if there are existing records in the database. If records exist, it only
     inserts new data if the earliest date in the DataFrame is more recent than the most recent
     date in the database. If no records exist, it proceeds with the initial load.
+    
     Parameters:
     conn (psycopg2.extensions.connection): The connection object to the PostgreSQL database.
     data (pandas.DataFrame): The DataFrame containing the benchmark data to be inserted. It must
                              have columns: 'date', 'price', 'open', 'high', 'low', 'vol', and 'change_percent'.
+    
     Returns:
     int: The number of rows inserted into the database. Returns -1 if records already exist and no new data was inserted.
     """
@@ -171,6 +188,9 @@ def load_initial_data(conn, data):
                     ))
                     rows_inserted += 1
                 conn.commit()
+            
+            # Reset sequence after insertion
+            reset_sequence(conn)
             return rows_inserted
         else:
             return -1  # Indicates that records already exist
@@ -193,6 +213,9 @@ def load_initial_data(conn, data):
                 ))
                 rows_inserted += 1
             conn.commit()
+        
+        # Reset sequence after insertion
+        reset_sequence(conn)
         return rows_inserted
 
 def incremental_update(conn, data):
@@ -232,6 +255,9 @@ def incremental_update(conn, data):
                     ))
                     rows_inserted += 1
                 conn.commit()
+            
+            # Reset sequence after insertion
+            reset_sequence(conn)
             return rows_inserted, len(new_data)
         else:
             return -1, 0  # No new records to insert
@@ -246,6 +272,9 @@ def refresh_data(conn):
         deleted_count = cur.fetchone()[0]
         cur.execute("DELETE FROM benchmark")
         conn.commit()
+    
+    # Reset sequence after deletion
+    reset_sequence(conn)
     return deleted_count
 
 def main():
@@ -296,7 +325,7 @@ def main():
         elif choice == "2":
             rows_inserted, new_data_count = incremental_update(conn, data)
             if rows_inserted == -1:
-                print("Records already exist in the table. No new records inserted.")
+                print("No new records to insert. Database is already up to date.")
             else:
                 print(f"Inserted {rows_inserted} of {new_data_count} new records.")
         elif choice == "3":
