@@ -56,13 +56,6 @@ def reset_sequence(conn):
         conn.commit()
 
 def preprocess_csv(csv_path):
-    Raises:
-        ValueError: If the CSV file does not contain a 'date' column, 
-                    if dates cannot be parsed, 
-                    if no valid data rows remain after date parsing,
-                    if the CSV file is empty,
-                    or if the CSV file cannot be found.
-        Exception: For any other errors encountered during processing.
     """
     Preprocess CSV data with robust date parsing and error handling.
     
@@ -71,6 +64,14 @@ def preprocess_csv(csv_path):
         
     Returns:
         pandas.DataFrame: Preprocessed dataframe with correct data types
+        
+    Raises:
+        ValueError: If the CSV file does not contain a 'date' column, 
+                    if dates cannot be parsed, 
+                    if no valid data rows remain after date parsing,
+                    if the CSV file is empty,
+                    or if the CSV file cannot be found.
+        Exception: For any other errors encountered during processing.
     """
     try:
         # Read CSV file
