@@ -77,26 +77,28 @@ def check_and_update_schema():
         conn.commit()
 
 def get_portfolio_data():
-    """Retrieve current portfolio data with latest NAVs"""
+    """Retrieve current portfolio data with latest NAVs using the improved calculation logic"""
     with connect_to_db() as conn:
         query = """
-            WITH latest_units AS (
-                SELECT scheme_name, code, SUM(
+            WITH transaction_units AS (
+                SELECT 
+                    scheme_name, 
+                    code,
                     CASE 
-                        WHEN transaction_type = 'switch' THEN -units
-                        WHEN transaction_type = 'redeem' THEN -units
-                        ELSE units 
-                    END
-                ) as total_units
+                        WHEN transaction_type IN ('switch_out', 'redeem') THEN -units
+                        WHEN transaction_type IN ('invest', 'switch_in') THEN units
+                        ELSE 0 
+                    END as units_change
                 FROM portfolio_data
+            ),
+            cumulative_units AS (
+                SELECT 
+                    scheme_name,
+                    code,
+                    SUM(units_change) as total_units
+                FROM transaction_units
                 GROUP BY scheme_name, code
-                HAVING SUM(
-                    CASE 
-                        WHEN transaction_type = 'switch' THEN -units
-                        WHEN transaction_type = 'redeem' THEN -units
-                        ELSE units 
-                    END
-                ) > 0
+                HAVING SUM(units_change) > 0
             ),
             latest_nav AS (
                 SELECT code, value as nav_value
@@ -108,11 +110,11 @@ def get_portfolio_data():
                 )
             )
             SELECT 
-                lu.scheme_name,
-                lu.code as scheme_code,
-                lu.total_units * ln.nav_value as current_value
-            FROM latest_units lu
-            JOIN latest_nav ln ON lu.code = ln.code
+                cu.scheme_name,
+                cu.code as scheme_code,
+                cu.total_units * ln.nav_value as current_value
+            FROM cumulative_units cu
+            JOIN latest_nav ln ON cu.code = ln.code
         """
         return pd.read_sql(query, conn)
 
@@ -164,28 +166,6 @@ def get_existing_goals():
         return pd.read_sql(query, conn)
 
 def main():
-    """
-    Main function to run the Investment Goal Mapping Tool application.
-    This function sets up the Streamlit page configuration, displays the title,
-    and initializes the application by checking and updating the database schema.
-    It then retrieves the current portfolio data and creates two tabs for mutual
-    fund mapping and manual investment entry. Users can map mutual funds to goals
-    or add manual investments through forms. The function also displays existing
-    goal mappings and provides a summary of the total portfolio value.
-    Tabs:
-        - Mutual Fund Mapping: Allows users to map mutual funds to specific goals.
-        - Manual Investment Entry: Allows users to add manual investments with details.
-    Forms:
-        - goal_mapping_form: Form to map mutual funds to goals.
-        - manual_investment_form: Form to add manual investments.
-    Displays:
-        - Goal-wise summary of current goal mappings.
-        - Total portfolio value.
-        - Detailed mappings of existing goals.
-    Raises:
-        Streamlit warnings and errors for various conditions such as empty portfolio data,
-        failed goal mappings, and duplicate fund mappings.
-    """
     st.set_page_config(page_title="Goal Mapping Tool", layout="wide")
     st.title("Investment Goal Mapping Tool")
 

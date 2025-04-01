@@ -95,9 +95,9 @@ def get_goal_mappings():
                 LEFT JOIN (
                     SELECT scheme_name, code,
                            SUM(CASE 
-                               WHEN transaction_type = 'switch' THEN -units
-                               WHEN transaction_type = 'redeem' THEN -units
-                               ELSE units 
+                               WHEN transaction_type IN ('switch_out', 'redeem') THEN -units
+                               WHEN transaction_type IN ('invest', 'switch_in') THEN units
+                               ELSE 0 
                            END) as units
                     FROM portfolio_data
                     GROUP BY scheme_name, code
@@ -121,11 +121,25 @@ def get_goal_mappings():
 def prepare_cashflows(df):
     """Prepare cashflow data from portfolio transactions"""
     df['cashflow'] = df.apply(lambda x: 
-        -x['amount'] if x['transaction_type'] == 'invest'
-        else x['amount'] if x['transaction_type'] == 'redeem'
-        else (-x['amount'] if x['transaction_type'] == 'switch' else 0), 
+        -x['amount'] if x['transaction_type'] in ('invest', 'switch_in')  # Negative because it's money going out
+        else x['amount'] if x['transaction_type'] in ('redeem', 'switch_out')  # Positive because it's money coming in
+        else 0, 
         axis=1
     )
+    return df
+
+def calculate_units(df):
+    """Calculate net units for each scheme based on transactions"""
+    df['units_change'] = df.apply(lambda x: 
+        x['units'] if x['transaction_type'] in ('invest', 'switch_in')
+        else -x['units'] if x['transaction_type'] in ('redeem', 'switch_out')
+        else 0,
+        axis=1
+    )
+    
+    # Calculate cumulative units for each scheme
+    df = df.sort_values(['scheme_name', 'date'])
+    df['cumulative_units'] = df.groupby(['scheme_name', 'code'])['units_change'].cumsum()
     return df
 
 def xirr(transactions):
@@ -154,14 +168,13 @@ def xirr(transactions):
 
 def calculate_portfolio_weights(df, latest_nav, goal_mappings):
     """Calculate current portfolio weights for each scheme including debt investments"""
-    # First calculate MF values
-    mf_df = df.groupby('scheme_name').agg({
-        'units': 'sum',
-        'code': 'first'
+    # First calculate MF values by getting the latest units for each scheme
+    mf_df = df.groupby(['scheme_name', 'code']).agg({
+        'cumulative_units': 'last'
     }).reset_index()
 
     mf_df = mf_df.merge(latest_nav, on='code', how='left')
-    mf_df['current_value'] = mf_df['units'] * mf_df['nav_value']
+    mf_df['current_value'] = mf_df['cumulative_units'] * mf_df['nav_value']
 
     # Get debt investments from goal mappings, excluding any that are already in MF investments
     debt_investments = goal_mappings[
@@ -192,61 +205,77 @@ def calculate_xirr(df, latest_nav, goal_mappings):
 
     for scheme in schemes:
         transactions = df[df['scheme_name'] == scheme].copy()
-        # Add the current value as a final cash flow
         if not transactions.empty:
-            latest_value = transactions['units'].sum() * latest_nav.loc[latest_nav['code'] == transactions['code'].iloc[0], 'nav_value'].values[0]
-            transactions = pd.concat([
-                transactions,
-                pd.DataFrame({'date': [datetime.now()], 'cashflow': [latest_value]})
-            ])
-            rate = xirr(transactions)
+            # Get the latest units and NAV
+            latest_units = transactions['cumulative_units'].iloc[-1]
+            nav = latest_nav.loc[latest_nav['code'] == transactions['code'].iloc[0], 'nav_value'].values[0]
+            latest_value = latest_units * nav
+            
+            # Prepare cashflows including the final value
+            scheme_cashflows = transactions[['date', 'cashflow']].copy()
+            final_cashflow = pd.DataFrame({
+                'date': [datetime.now()],
+                'cashflow': [latest_value]  # Positive because it's money coming in
+            })
+            
+            scheme_transactions = pd.concat([scheme_cashflows, final_cashflow])
+            rate = xirr(scheme_transactions)
             xirr_results[scheme] = round(rate * 100, 1) if rate is not None else 0
 
     # Calculate portfolio growth and overall XIRR
     unique_dates = df['date'].sort_values().unique()
 
     for date in unique_dates:
+        # Get all transactions up to this date
         transactions_up_to_date = df[df['date'] <= date].copy()
-        transactions_up_to_date = transactions_up_to_date.merge(latest_nav, on='code', how='left')
-        transactions_up_to_date['current_value'] = transactions_up_to_date['units'] * transactions_up_to_date['nav_value']
+        
+        # For each scheme, get the units as of this date along with the code
+        current_units = transactions_up_to_date.groupby(['scheme_name', 'code'])['cumulative_units'].last().reset_index()
+        current_units = current_units.merge(latest_nav, on='code', how='left')
+        current_units['current_value'] = current_units['cumulative_units'] * current_units['nav_value']
         
         # Include debt investments in the portfolio value
         debt_value_on_date = goal_mappings[goal_mappings['investment_type'] == 'Debt']['current_value'].sum()
-        total_value_on_date = transactions_up_to_date['current_value'].sum() + debt_value_on_date
+        total_value_on_date = current_units['current_value'].sum() + debt_value_on_date
         
         portfolio_growth.append({'date': date, 'value': total_value_on_date})
 
     # Calculate overall portfolio XIRR
-    total_transactions = df.copy()
-    if not total_transactions.empty:
-        total_transactions = total_transactions.merge(latest_nav, on='code', how='left')
-        total_transactions['current_value'] = total_transactions['units'] * total_transactions['nav_value']
+    if not df.empty:
+        # Get all cashflows (investments and redemptions)
+        portfolio_cashflows = df[['date', 'cashflow']].copy()
         
-        # Include debt investments in the final portfolio value
+        # Calculate final portfolio value
+        final_units = df.groupby(['scheme_name', 'code'])['cumulative_units'].last().reset_index()
+        final_units = final_units.merge(latest_nav, on='code', how='left')
+        final_units['current_value'] = final_units['cumulative_units'] * final_units['nav_value']
         debt_final_value = goal_mappings[goal_mappings['investment_type'] == 'Debt']['current_value'].sum()
-        portfolio_final_value = pd.DataFrame({
+        final_portfolio_value = final_units['current_value'].sum() + debt_final_value
+        
+        # Add final value as a cashflow
+        final_cashflow = pd.DataFrame({
             'date': [datetime.now()],
-            'cashflow': [total_transactions['current_value'].sum() + debt_final_value]
+            'cashflow': [final_portfolio_value]
         })
         
-        total_cashflow = total_transactions[['date', 'cashflow']]
-        total_transactions = pd.concat([total_cashflow, portfolio_final_value])
-        portfolio_xirr = xirr(total_transactions)
+        portfolio_transactions = pd.concat([portfolio_cashflows, final_cashflow])
+        portfolio_xirr = xirr(portfolio_transactions)
         xirr_results['Portfolio'] = round(portfolio_xirr * 100, 1) if portfolio_xirr is not None else 0
 
     # Calculate Mutual Fund Portfolio XIRR (excluding debt investments)
-    mf_transactions = df.copy()
-    if not mf_transactions.empty:
-        mf_transactions = mf_transactions.merge(latest_nav, on='code', how='left')
-        mf_transactions['current_value'] = mf_transactions['units'] * mf_transactions['nav_value']
+    if not df.empty:
+        mf_cashflows = df[['date', 'cashflow']].copy()
         
-        mf_final_value = pd.DataFrame({
+        final_mf_units = df.groupby(['scheme_name', 'code'])['cumulative_units'].last().reset_index()
+        final_mf_units = final_mf_units.merge(latest_nav, on='code', how='left')
+        final_mf_value = (final_mf_units['cumulative_units'] * final_mf_units['nav_value']).sum()
+        
+        mf_final_cashflow = pd.DataFrame({
             'date': [datetime.now()],
-            'cashflow': [mf_transactions['current_value'].sum()]
+            'cashflow': [final_mf_value]
         })
         
-        mf_cashflow = mf_transactions[['date', 'cashflow']]
-        mf_transactions = pd.concat([mf_cashflow, mf_final_value])
+        mf_transactions = pd.concat([mf_cashflows, mf_final_cashflow])
         mf_xirr = xirr(mf_transactions)
         xirr_results['Mutual Fund Portfolio'] = round(mf_xirr * 100, 1) if mf_xirr is not None else 0
 
@@ -266,6 +295,7 @@ def main():
 
     df['date'] = pd.to_datetime(df['date'])
     df = prepare_cashflows(df)
+    df = calculate_units(df)
 
     # Calculate XIRR and Portfolio Growth
     xirr_results, portfolio_growth_df = calculate_xirr(df, latest_nav, goal_mappings)
@@ -281,8 +311,8 @@ def main():
     equity_percent = (equity_value / total_portfolio_value) * 100 if total_portfolio_value > 0 else 0
     debt_percent = (debt_value / total_portfolio_value) * 100 if total_portfolio_value > 0 else 0
 
-    # Calculate total invested amount
-    mf_invested = df[df['transaction_type'] == 'invest']['amount'].sum()
+    # Calculate total invested amount (only investments, not redemptions)
+    mf_invested = df[df['transaction_type'].isin(['invest', 'switch_in'])]['amount'].sum()
     debt_invested = goal_mappings[goal_mappings['investment_type'] == 'Debt']['current_value'].sum()
     total_invested = mf_invested + debt_invested
 
@@ -294,7 +324,7 @@ def main():
     with col1:
         st.metric("Mutual Fund Portfolio XIRR", f"{xirr_results['Mutual Fund Portfolio']:.1f}%")
     with col2:
-        st.metric("Current Portfolio Value ( including EPF and PPF )", format_indian_number(total_portfolio_value))
+        st.metric("Current Portfolio Value (including EPF and PPF)", format_indian_number(total_portfolio_value))
     
     # Row 2: Equity and Debt Values
     col3, col4 = st.columns(2)
@@ -308,7 +338,7 @@ def main():
     with col5:
         st.metric("Total Invested Amount", format_indian_number(total_invested))
 
-    # Display Individual Scheme Metrics
+    # Display Individual Fund Metrics
     st.subheader("Individual Fund Metrics")
     fund_metrics = weights_df[['scheme_name', 'current_value', 'weight']].copy()
     fund_metrics['Current Value'] = fund_metrics['current_value'].apply(format_indian_number)
