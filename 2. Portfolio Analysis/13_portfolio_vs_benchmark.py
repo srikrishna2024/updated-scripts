@@ -22,16 +22,23 @@ def get_portfolio_data():
     with connect_to_db() as conn:
         query = """
             SELECT p.date, p.scheme_name, p.code, p.transaction_type, 
-                   p.value, p.units, p.amount,
-                   n.value as nav_value
+                   p.value, p.units, p.amount
             FROM portfolio_data p
-            LEFT JOIN mutual_fund_nav n ON p.code = n.code
-            AND n.nav = (
-                SELECT MAX(nav)
-                FROM mutual_fund_nav
-                WHERE code = p.code
-            )
             ORDER BY p.date
+        """
+        return pd.read_sql(query, conn)
+
+def get_latest_nav():
+    """Retrieve the latest NAVs for all funds"""
+    with connect_to_db() as conn:
+        query = """
+            SELECT code, value as nav_value
+            FROM mutual_fund_nav
+            WHERE (code, nav) IN (
+                SELECT code, MAX(nav)
+                FROM mutual_fund_nav
+                GROUP BY code
+            )
         """
         return pd.read_sql(query, conn)
 
@@ -45,50 +52,92 @@ def get_benchmark_data():
         """
         return pd.read_sql(query, conn)
 
-def calculate_growth(portfolio_df, benchmark_df, selected_fund):
+def calculate_units(df):
+    """Calculate net units for each scheme based on transactions"""
+    df['units_change'] = df.apply(lambda x: 
+        x['units'] if x['transaction_type'] in ('invest', 'switch_in')
+        else -x['units'] if x['transaction_type'] in ('redeem', 'switch_out')
+        else 0,
+        axis=1
+    )
+    
+    # Calculate cumulative units for each scheme
+    df = df.sort_values(['scheme_name', 'date'])
+    df['cumulative_units'] = df.groupby(['scheme_name', 'code'])['units_change'].cumsum()
+    return df
+
+def calculate_growth(portfolio_df, benchmark_df, latest_nav, selected_fund):
     """Calculate growth for both portfolio and benchmark investments"""
     # Filter for selected fund
     fund_data = portfolio_df[portfolio_df['scheme_name'] == selected_fund].copy()
     
-    # Calculate cumulative investment and units for the fund
-    fund_data['cumulative_investment'] = fund_data[fund_data['transaction_type'] == 'invest']['amount'].cumsum()
-    fund_data['cumulative_units'] = fund_data['units'].cumsum()
+    if fund_data.empty:
+        return pd.DataFrame(), pd.DataFrame()
     
-    # Calculate daily fund value using latest NAV
-    fund_data['current_value'] = fund_data['cumulative_units'] * fund_data['nav_value']
+    # Get the fund code
+    fund_code = fund_data['code'].iloc[0]
     
-    # For benchmark calculation
-    benchmark_df = benchmark_df.copy()
-    benchmark_start_value = benchmark_df.iloc[0]['price']
+    # Get the latest NAV for this fund
+    fund_nav = latest_nav[latest_nav['code'] == fund_code]['nav_value'].iloc[0]
     
-    # Calculate benchmark investment growth
-    # For each investment in the fund, calculate equivalent benchmark units
-    benchmark_units = []
-    total_benchmark_units = 0
+    # Calculate current value for each date
+    fund_growth = []
+    unique_dates = fund_data['date'].unique()
     
-    for _, row in fund_data[fund_data['transaction_type'] == 'invest'].iterrows():
-        benchmark_value_on_date = benchmark_df[benchmark_df['date'] <= row['date']]['price'].iloc[-1]
-        benchmark_units_bought = row['amount'] / benchmark_value_on_date
-        total_benchmark_units += benchmark_units_bought
-        benchmark_units.append(total_benchmark_units)
+    for date in unique_dates:
+        # Get transactions up to this date
+        transactions_to_date = fund_data[fund_data['date'] <= date].copy()
+        
+        # Get NAV for this date
+        nav_on_date = benchmark_df[benchmark_df['date'] <= date]['price'].iloc[-1]
+        
+        # Calculate cumulative units up to this date
+        current_units = transactions_to_date['cumulative_units'].iloc[-1] if not transactions_to_date.empty else 0
+        
+        # Calculate current value
+        current_value = current_units * fund_nav
+        
+        fund_growth.append({
+            'date': date,
+            'current_value': current_value
+        })
     
-    # Create benchmark growth series
+    fund_growth_df = pd.DataFrame(fund_growth)
+    
+    # For benchmark calculation - calculate equivalent benchmark investment
     benchmark_growth = []
-    for date in fund_data['date'].unique():
-        if date in benchmark_df['date'].values:
-            benchmark_value = benchmark_df[benchmark_df['date'] <= date]['price'].iloc[-1]
-            current_units = fund_data[fund_data['date'] <= date]
-            current_units = current_units[current_units['transaction_type'] == 'invest']
-            if not current_units.empty:
-                total_units = current_units['units'].sum()
+    initial_benchmark_value = benchmark_df.iloc[0]['price']
+    
+    # Get all investment dates and amounts
+    investments = fund_data[fund_data['transaction_type'].isin(['invest', 'switch_in'])].copy()
+    
+    if not investments.empty:
+        for _, row in investments.iterrows():
+            # Get benchmark value on investment date
+            benchmark_value_on_date = benchmark_df[benchmark_df['date'] <= row['date']]['price'].iloc[-1]
+            
+            # Calculate benchmark units bought
+            benchmark_units = row['amount'] / benchmark_value_on_date
+            
+            # For each subsequent date, calculate benchmark value
+            subsequent_dates = benchmark_df[benchmark_df['date'] >= row['date']]
+            
+            for _, b_row in subsequent_dates.iterrows():
                 benchmark_growth.append({
-                    'date': date,
-                    'value': benchmark_value * total_benchmark_units
+                    'date': b_row['date'],
+                    'investment_date': row['date'],
+                    'benchmark_units': benchmark_units,
+                    'benchmark_value': benchmark_units * b_row['price']
                 })
     
-    benchmark_growth_df = pd.DataFrame(benchmark_growth)
+    if benchmark_growth:
+        benchmark_growth_df = pd.DataFrame(benchmark_growth)
+        # Sum all benchmark investments for each date
+        benchmark_growth_df = benchmark_growth_df.groupby('date')['benchmark_value'].sum().reset_index()
+    else:
+        benchmark_growth_df = pd.DataFrame(columns=['date', 'benchmark_value'])
     
-    return fund_data[['date', 'current_value']], benchmark_growth_df
+    return fund_growth_df, benchmark_growth_df
 
 def main():
     st.set_page_config(page_title="Fund vs Benchmark Comparison", layout="wide")
@@ -96,9 +145,10 @@ def main():
     
     # Load data
     portfolio_df = get_portfolio_data()
+    latest_nav = get_latest_nav()
     benchmark_df = get_benchmark_data()
     
-    if portfolio_df.empty or benchmark_df.empty:
+    if portfolio_df.empty or benchmark_df.empty or latest_nav.empty:
         st.warning("No data found. Please ensure portfolio and benchmark data are available.")
         return
     
@@ -106,17 +156,24 @@ def main():
     portfolio_df['date'] = pd.to_datetime(portfolio_df['date'])
     benchmark_df['date'] = pd.to_datetime(benchmark_df['date'])
     
+    # Calculate cumulative units
+    portfolio_df = calculate_units(portfolio_df)
+    
     # Create fund selector
     available_funds = portfolio_df['scheme_name'].unique()
     selected_fund = st.selectbox("Select Fund", available_funds)
     
     # Calculate growth
-    fund_growth, benchmark_growth = calculate_growth(portfolio_df, benchmark_df, selected_fund)
+    fund_growth, benchmark_growth = calculate_growth(portfolio_df, benchmark_df, latest_nav, selected_fund)
+    
+    if fund_growth.empty or benchmark_growth.empty:
+        st.warning("No growth data available for the selected fund.")
+        return
     
     # Create plot
     fig, ax = plt.subplots(figsize=(12, 6))
     sns.lineplot(data=fund_growth, x='date', y='current_value', label=selected_fund, ax=ax)
-    sns.lineplot(data=benchmark_growth, x='date', y='value', label='Nifty50 TRI', ax=ax)
+    sns.lineplot(data=benchmark_growth, x='date', y='benchmark_value', label='Nifty50 TRI', ax=ax)
     
     plt.title(f"{selected_fund} vs Nifty50 TRI")
     plt.xlabel("Date")
@@ -128,27 +185,31 @@ def main():
     # Display plot
     st.pyplot(fig)
     
+    # Calculate metrics
+    # Total investment is sum of all 'invest' and 'switch_in' transactions
+    total_investment = portfolio_df[
+        (portfolio_df['scheme_name'] == selected_fund) & 
+        (portfolio_df['transaction_type'].isin(['invest', 'switch_in']))
+    ]['amount'].sum()
+    
+    current_fund_value = fund_growth['current_value'].iloc[-1]
+    current_benchmark_value = benchmark_growth['benchmark_value'].iloc[-1]
+    
     # Display metrics
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        initial_investment = portfolio_df[
-            (portfolio_df['scheme_name'] == selected_fund) & 
-            (portfolio_df['transaction_type'] == 'invest')
-        ]['amount'].sum()
-        st.metric("Total Investment", f"₹{initial_investment:,.2f}")
+        st.metric("Total Investment", f"₹{total_investment:,.2f}")
     
     with col2:
-        current_fund_value = fund_growth['current_value'].iloc[-1]
         st.metric("Current Fund Value", f"₹{current_fund_value:,.2f}")
     
     with col3:
-        current_benchmark_value = benchmark_growth['value'].iloc[-1]
         st.metric("Nifty50 TRI Value", f"₹{current_benchmark_value:,.2f}")
     
     # Calculate and display returns
-    fund_returns = ((current_fund_value - initial_investment) / initial_investment) * 100
-    benchmark_returns = ((current_benchmark_value - initial_investment) / initial_investment) * 100
+    fund_returns = ((current_fund_value - total_investment) / total_investment) * 100
+    benchmark_returns = ((current_benchmark_value - total_investment) / total_investment) * 100
     
     col1, col2 = st.columns(2)
     with col1:

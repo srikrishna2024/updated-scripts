@@ -80,7 +80,6 @@ def get_fund_transactions(fund_codes):
             SELECT date, scheme_name, code, transaction_type, units, amount
             FROM portfolio_data
             WHERE code = ANY(%s)
-            AND units > 0
             ORDER BY date
         """
         return pd.read_sql(query, conn, params=(fund_codes,))
@@ -89,6 +88,20 @@ def get_fund_transactions(fund_codes):
         return pd.DataFrame()
     finally:
         conn.close()
+
+def calculate_units(df):
+    """Calculate net units for each scheme based on transactions"""
+    df['units_change'] = df.apply(lambda x: 
+        x['units'] if x['transaction_type'] in ('invest', 'switch_in')
+        else -x['units'] if x['transaction_type'] in ('redeem', 'switch_out')
+        else 0,
+        axis=1
+    )
+    
+    # Calculate cumulative units for each scheme
+    df = df.sort_values(['scheme_name', 'date'])
+    df['cumulative_units'] = df.groupby(['scheme_name', 'code'])['units_change'].cumsum()
+    return df
 
 def xirr(transactions):
     """Calculate XIRR given a set of cash flows"""
@@ -138,13 +151,16 @@ def calculate_fund_xirr(transactions_df, nav_df, fund_code=None):
         # Add all investments/redemptions
         for _, row in relevant_transactions.iterrows():
             amount = row['amount']
-            if row['transaction_type'] not in ('invest', 'switch_in'):
-                amount = -amount
-            
-            cashflows.append({
-                'date': row['date'],
-                'amount': -amount  # Negative because investments are outflows
-            })
+            if row['transaction_type'] in ('invest', 'switch_in'):
+                cashflows.append({
+                    'date': row['date'],
+                    'amount': -amount  # Negative because investments are outflows
+                })
+            elif row['transaction_type'] in ('redeem', 'switch_out'):
+                cashflows.append({
+                    'date': row['date'],
+                    'amount': amount  # Positive because redemptions are inflows
+                })
         
         # Add current value as final cash flow
         latest_date = nav_df['date'].max()
@@ -161,11 +177,8 @@ def calculate_fund_xirr(transactions_df, nav_df, fund_code=None):
                 
             latest_nav = latest_nav_data['nav_value'].iloc[0]
             
-            current_units = sum(
-                row['units'] if row['transaction_type'] in ('invest', 'switch_in')
-                else -row['units']
-                for _, row in relevant_transactions.iterrows()
-            )
+            # Get cumulative units from the transactions dataframe
+            current_units = relevant_transactions['cumulative_units'].iloc[-1]
             
             current_value = current_units * latest_nav
         else:
@@ -178,21 +191,15 @@ def calculate_fund_xirr(transactions_df, nav_df, fund_code=None):
                     (nav_df['code'] == code)
                 ]
                 
-                if not latest_nav_data.empty:
+                if not latest_nav_data.empty and not fund_transactions.empty:
                     fund_nav = latest_nav_data['nav_value'].iloc[0]
-                    
-                    fund_units = sum(
-                        row['units'] if row['transaction_type'] in ('invest', 'switch_in')
-                        else -row['units']
-                        for _, row in fund_transactions.iterrows()
-                    )
-                    
+                    fund_units = fund_transactions['cumulative_units'].iloc[-1]
                     current_value += fund_units * fund_nav
         
         if current_value > 0:
             cashflows.append({
                 'date': latest_date,
-                'amount': current_value
+                'amount': current_value  # Positive because it's money coming in
             })
         
         if len(cashflows) < 2:  # Need at least two cash flows for XIRR
@@ -224,27 +231,26 @@ def calculate_portfolio_value(transactions_df, nav_df):
             # Calculate for each fund
             for code in transactions_to_date['code'].unique():
                 fund_transactions = transactions_to_date[transactions_to_date['code'] == code]
-                net_units = sum(
-                    row['units'] if row['transaction_type'] in ('invest', 'switch_in')
-                    else -row['units']
-                    for _, row in fund_transactions.iterrows()
-                )
                 
-                # Get NAV for this date and fund
-                current_nav = nav_df[
-                    (nav_df['date'] == date) & 
-                    (nav_df['code'] == code)
-                ]['nav_value'].iloc[0] if not nav_df[
-                    (nav_df['date'] == date) & 
-                    (nav_df['code'] == code)
-                ].empty else 0
-                
-                fund_value = net_units * current_nav
-                if fund_value > 0:  # Only add non-zero values
-                    scheme_name = transactions_df[
-                        transactions_df['code'] == code
-                    ]['scheme_name'].iloc[0]
-                    daily_values[scheme_name] = fund_value
+                if not fund_transactions.empty:
+                    # Get cumulative units up to this date
+                    current_units = fund_transactions['cumulative_units'].iloc[-1]
+                    
+                    # Get NAV for this date and fund
+                    current_nav = nav_df[
+                        (nav_df['date'] == date) & 
+                        (nav_df['code'] == code)
+                    ]['nav_value'].iloc[0] if not nav_df[
+                        (nav_df['date'] == date) & 
+                        (nav_df['code'] == code)
+                    ].empty else 0
+                    
+                    fund_value = current_units * current_nav
+                    if fund_value > 0:  # Only add non-zero values
+                        scheme_name = transactions_df[
+                            transactions_df['code'] == code
+                        ]['scheme_name'].iloc[0]
+                        daily_values[scheme_name] = fund_value
             
             if daily_values:  # Add the date's values if we have any fund values
                 portfolio_values.append(daily_values)
@@ -265,6 +271,7 @@ def format_value(x, p):
         return f'₹{x/1000:.1f}K'
     else:
         return f'₹{x:.0f}'
+
 def calculate_time_based_returns(portfolio_value_df, months):
     """Calculate absolute value change over specified number of months"""
     try:
@@ -295,27 +302,8 @@ def calculate_time_based_returns(portfolio_value_df, months):
     except Exception as e:
         st.error(f"Error calculating {months}-month returns: {str(e)}")
         return None
+
 def main():
-    """
-    Main function to run the Portfolio Value Tracker Streamlit application.
-    This function sets up the Streamlit page configuration, retrieves available funds,
-    allows the user to select funds to track, fetches NAV and transaction data for the
-    selected funds, calculates portfolio values, and displays various metrics and plots.
-    The function performs the following steps:
-    1. Sets the page title and layout.
-    2. Retrieves available funds from the database.
-    3. Allows the user to select funds to track using a multi-select widget.
-    4. Fetches NAV and transaction data for the selected funds.
-    5. Calculates portfolio values over time.
-    6. Plots the portfolio value progression over time.
-    7. Calculates and displays time-based returns (1-month, 3-month, 6-month).
-    8. Displays metrics for each selected fund, including current value and XIRR.
-    9. Displays total portfolio metrics, including total value, portfolio XIRR, and gains/losses.
-    10. Provides an expandable section to view raw data.
-    If any errors occur during the execution, they are caught and displayed as error messages.
-    Raises:
-        Exception: If any error occurs during the execution of the function.
-    """
     st.set_page_config(page_title="Portfolio Value Tracker", layout="wide")
     st.title("Portfolio Value Tracker")
     
@@ -355,6 +343,9 @@ def main():
             if transaction_data.empty:
                 st.error("No transaction data available for selected funds.")
                 return
+            
+            # Calculate cumulative units for each fund
+            transaction_data = calculate_units(transaction_data)
             
             # Calculate portfolio value
             portfolio_value_df = calculate_portfolio_value(transaction_data, nav_data)

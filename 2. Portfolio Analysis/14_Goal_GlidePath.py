@@ -4,36 +4,15 @@ import psycopg
 from plotly import graph_objects as go
 
 def format_indian_number(number):
-    """Format a number in Indian style with commas (e.g., 1,00,000)"""
-    str_number = str(int(number))
-    if len(str_number) <= 3:
-        return str_number
-    
-    # Split the number into integer and decimal parts if it's a float
-    if isinstance(number, float):
-        decimal_part = f"{number:.2f}".split('.')[1]
+    """Format a number in Indian style (lakhs, crores)"""
+    if number >= 10000000:  # crores
+        return f"₹{number/10000000:.2f} Cr"
+    elif number >= 100000:  # lakhs
+        return f"₹{number/100000:.2f} L"
+    elif number >= 1000:  # thousands
+        return f"₹{number/1000:.2f} K"
     else:
-        decimal_part = None
-    
-    # Format integer part with Indian style commas
-    last_three = str_number[-3:]
-    other_numbers = str_number[:-3]
-    
-    if other_numbers:
-        formatted_number = ''
-        for i, digit in enumerate(reversed(other_numbers)):
-            if i % 2 == 0 and i != 0:
-                formatted_number = ',' + formatted_number
-            formatted_number = digit + formatted_number
-        formatted_number = formatted_number + ',' + last_three
-    else:
-        formatted_number = last_three
-    
-    # Add decimal part if exists
-    if decimal_part:
-        formatted_number = f"{formatted_number}.{decimal_part}"
-    
-    return formatted_number
+        return f"₹{number:.2f}"
 
 def connect_to_db():
     """Establish a database connection."""
@@ -55,6 +34,7 @@ def get_goals():
 def get_goal_data(goal_name):
     """Retrieve current equity and debt investment data for a selected goal."""
     with connect_to_db() as conn:
+        # Get current investments
         query = """
         SELECT investment_type, SUM(current_value) AS total_value
         FROM goals
@@ -63,7 +43,25 @@ def get_goal_data(goal_name):
         """
         df = pd.read_sql(query, conn, params=[goal_name])
         investments = {row['investment_type']: row['total_value'] for _, row in df.iterrows()}
-        return investments.get('Equity', 0), investments.get('Debt', 0)
+        
+        # Get current NAV values for all funds in this goal
+        query = """
+        SELECT g.code, g.scheme_name, g.units, mf.nav_value
+        FROM goals g
+        JOIN mutual_fund_nav mf ON g.code = mf.code 
+        WHERE g.goal_name = %s
+        AND mf.nav = (SELECT MAX(nav) FROM mutual_fund_nav WHERE code = g.code)
+        """
+        nav_data = pd.read_sql(query, conn, params=[goal_name])
+        
+        # Calculate current values
+        if not nav_data.empty:
+            nav_data['current_value'] = nav_data['units'] * nav_data['nav_value']
+            equity_value = nav_data[nav_data['investment_type'] == 'Equity']['current_value'].sum()
+            debt_value = nav_data[nav_data['investment_type'] == 'Debt']['current_value'].sum()
+            return equity_value, debt_value
+        else:
+            return investments.get('Equity', 0), investments.get('Debt', 0)
 
 def calculate_growth(initial, rate, years, annual_contribution=0):
     """Calculate yearly growth based on compound interest and contributions."""
@@ -133,11 +131,12 @@ def calculate_total_growth_glidepath(
         'Year': list(range(1, years + 2)),
         'Equity': equity_values,
         'Debt': debt_values,
-        'Total': total_values
+        'Total': total_values,
+        'Equity Allocation': [starting_equity_allocation] + equity_allocations,
+        'Debt Allocation': [100 - starting_equity_allocation] + debt_allocations
     })
 
     return growth_df, total_values[-1]
-
 
 def create_comparison_plot(years, expected_growth, conservative_growth, benchmark_growth):
     """Generate an interactive plot comparing different growth paths."""
@@ -172,58 +171,6 @@ def create_comparison_plot(years, expected_growth, conservative_growth, benchmar
     )
     return fig
 
-def suggest_allocation_adjustment(target, actual, equity_rate, debt_rate, years, annual_investment, investment_increase=0):
-    """Suggest an optimal equity-debt allocation to meet the target."""
-    for equity_split in range(100, -1, -1):
-        debt_split = 100 - equity_split
-        growth_values, _ = calculate_total_growth(
-            actual, 0, equity_rate, debt_rate, years, 
-            annual_investment, equity_split, debt_split, 
-            investment_increase
-        )
-        if growth_values[-1] >= target:
-            return equity_split, debt_split, annual_investment
-
-    # If no solution found, try increasing the investment amount
-    for increment in range(1, 101):
-        increased_investment = annual_investment * (1 + increment / 100)
-        for equity_split in range(100, -1, -1):
-            debt_split = 100 - equity_split
-            growth_values, _ = calculate_total_growth(
-                actual, 0, equity_rate, debt_rate, years,
-                increased_investment, equity_split, debt_split,
-                investment_increase
-            )
-            if growth_values[-1] >= target:
-                return equity_split, debt_split, increased_investment
-    return 100, 0, annual_investment
-
-def create_simulation_plot(years, initial, equity_rate, debt_rate, equity_split, debt_split, investment):
-    """Create a simulation plot for suggested allocation."""
-    projected_growth = calculate_growth(
-        initial,
-        (equity_rate * equity_split / 100 + debt_rate * debt_split / 100),
-        years,
-        investment
-    )
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        y=projected_growth,
-        name="Projected Growth",
-        mode="lines+markers",
-        hovertemplate="₹%{y:,.2f}<extra></extra>"
-    ))
-    fig.update_layout(
-        title="Simulation of Suggested Allocation",
-        xaxis_title="Years",
-        yaxis_title="Value (₹)",
-        legend_title="Simulation",
-        yaxis=dict(
-            tickformat=",",
-            separatethousands=True
-        )
-    )
-    return fig
 def create_simulation_plot_with_glidepath(growth_df):
     """
     Create a simulation plot showing equity, debt, and total growth over the years.
@@ -311,47 +258,9 @@ def calculate_retirement_needs(current_expenses, inflation_rate, years_to_retire
 
     return total_corpus_needed, breakdown_df
 
-def suggest_retirement_allocation(target_corpus, current_corpus, years_to_retire, equity_rate, debt_rate, annual_investment, investment_increase, risk_profile='Moderate'):
-    """
-    Suggest retirement portfolio allocation based on years to retirement and risk profile.
-    Now includes investment_increase parameter.
-    """
-    if years_to_retire > 20:
-        base_equity = 75
-    elif years_to_retire > 10:
-        base_equity = 65
-    elif years_to_retire > 5:
-        base_equity = 50
-    else:
-        base_equity = 40
-    
-    risk_adjustments = {
-        'Conservative': -10,
-        'Moderate': 0,
-        'Aggressive': 10
-    }
-    
-    equity_allocation = min(80, max(20, base_equity + risk_adjustments.get(risk_profile, 0)))
-    debt_allocation = 100 - equity_allocation
-    
-    # Calculate with investment increase
-    projected_values, _ = calculate_total_growth(
-        current_corpus * (equity_allocation/100),
-        current_corpus * (debt_allocation/100),
-        equity_rate,
-        debt_rate,
-        years_to_retire,
-        annual_investment,
-        equity_allocation,
-        debt_allocation,
-        investment_increase
-    )
-    
-    return equity_allocation, debt_allocation, projected_values[-1]
-
 def main():
-    st.set_page_config(page_title="Are We On Track Tool", layout="wide")
-    st.title("Are We On Track Tool")
+    st.set_page_config(page_title="Goal GlidePath Analysis", layout="wide")
+    st.title("Goal GlidePath Analysis")
 
     # Retrieve goals from the database
     goals = get_goals()
@@ -364,11 +273,21 @@ def main():
     if not selected_goal:
         return
 
+    # Get current investments with NAV-based current values
     equity, debt = get_goal_data(selected_goal)
-    st.write(f"Initial Equity: ₹{format_indian_number(equity)}, Initial Debt: ₹{format_indian_number(debt)}")
+    total_current_value = equity + debt
+    
+    st.subheader("Current Investment Status")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Equity Value", format_indian_number(equity))
+    with col2:
+        st.metric("Debt Value", format_indian_number(debt))
+    with col3:
+        st.metric("Total Current Value", format_indian_number(total_current_value))
 
     # Investment details
-    st.subheader("Investment Details")
+    st.subheader("Investment Plan")
     col1, col2 = st.columns(2)
     with col1:
         annual_investment = st.number_input("Initial Yearly Investment (₹)", min_value=0, value=50000)
@@ -383,7 +302,7 @@ def main():
         target_corpus = st.number_input("Target Corpus (₹)", min_value=0, value=1000000)
 
     # Glide path allocation details
-    st.subheader("Glide Path Allocation Details")
+    st.subheader("Asset Allocation Strategy")
     if selected_goal.lower() == "retirement":
         col1, col2 = st.columns(2)
         with col1:
@@ -426,7 +345,7 @@ def main():
     )
 
     # Calculate benchmark growth
-    benchmark_values = [equity + debt]
+    benchmark_values = [total_current_value]
     current_investment = annual_investment
     for year in range(1, years + 1):
         new_value = benchmark_values[-1] * (1 + benchmark_rate) + current_investment
@@ -434,7 +353,7 @@ def main():
         current_investment *= (1 + investment_increase)
 
     # Display the simulation plot
-    st.subheader("Simulation Plot")
+    st.subheader("Projected Growth")
     simulation_plot = create_simulation_plot_with_glidepath(growth_df)
     simulation_plot.add_trace(go.Scatter(
         x=list(range(1, years + 2)),
@@ -443,34 +362,64 @@ def main():
         name='Benchmark Growth',
         hovertemplate="Year %{x}<br>₹%{y:,.2f}<extra></extra>"
     ))
-    st.plotly_chart(simulation_plot)
+    st.plotly_chart(simulation_plot, use_container_width=True)
+
+    # Allocation chart
+    st.subheader("Allocation Over Time")
+    allocation_plot = go.Figure()
+    allocation_plot.add_trace(go.Scatter(
+        x=growth_df['Year'],
+        y=growth_df['Equity Allocation'],
+        mode='lines+markers',
+        name='Equity Allocation',
+        hovertemplate="Year %{x}<br>%{y:.1f}%<extra></extra>"
+    ))
+    allocation_plot.add_trace(go.Scatter(
+        x=growth_df['Year'],
+        y=growth_df['Debt Allocation'],
+        mode='lines+markers',
+        name='Debt Allocation',
+        hovertemplate="Year %{x}<br>%{y:.1f}%<extra></extra>"
+    ))
+    allocation_plot.update_layout(
+        title="Asset Allocation Glide Path",
+        xaxis_title="Year",
+        yaxis_title="Allocation (%)",
+        legend_title="Asset Class"
+    )
+    st.plotly_chart(allocation_plot, use_container_width=True)
 
     # Insights
-    st.subheader("Insights")
+    st.subheader("Projection Summary")
     final_equity = growth_df['Equity'].iloc[-1]
     final_debt = growth_df['Debt'].iloc[-1]
-    st.write(f"Final Equity: ₹{format_indian_number(final_equity)}")
-    st.write(f"Final Debt: ₹{format_indian_number(final_debt)}")
-    st.write(f"Total Final Value: ₹{format_indian_number(final_value)}")
-
     benchmark_final = benchmark_values[-1]
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Projected Equity Value", format_indian_number(final_equity))
+    with col2:
+        st.metric("Projected Debt Value", format_indian_number(final_debt))
+    with col3:
+        st.metric("Projected Total Value", format_indian_number(final_value))
 
     # On Track or Off Track Analysis
+    st.subheader("Goal Status")
     if selected_goal.lower() == "retirement":
         if final_value >= benchmark_final:
-            st.success("You are on track to meet your goal!")
+            st.success("✅ You are on track to meet your retirement goal!")
         else:
-            st.error("You are off track. Consider adjusting your investments.")
+            st.error("⚠️ You are off track. Consider adjusting your investments.")
     else:
-        if equity + debt >= target_corpus:
-            st.success("You are already on track to meet your target corpus!")
+        if total_current_value >= target_corpus:
+            st.success("✅ You have already achieved your target corpus!")
         elif final_value >= target_corpus:
-            st.success("You are on track to meet your target corpus!")
+            st.success("✅ You are on track to meet your target corpus!")
         else:
-            st.error("You are off track. Consider increasing your investments or adjusting your allocation.")
+            st.error("⚠️ You are off track. Consider increasing your investments or adjusting your allocation.")
 
     if selected_goal.lower() == "retirement":
-        st.subheader("Retirement Planning Insights")
+        st.subheader("Retirement Planning Details")
         current_age = st.number_input("Current Age", min_value=20, max_value=70, value=30)
         retirement_age = st.number_input("Retirement Age", min_value=current_age + 1, max_value=80, value=60)
         life_expectancy = st.number_input("Life Expectancy", min_value=retirement_age + 1, max_value=100, value=80)
@@ -482,12 +431,12 @@ def main():
             current_expenses, inflation_rate, years_to_retire, life_expectancy
         )
 
-        st.write(f"Total Retirement Corpus Required at Age {retirement_age}: ₹{format_indian_number(retirement_corpus_needed)}")
+        st.write(f"Total Retirement Corpus Required at Age {retirement_age}: {format_indian_number(retirement_corpus_needed)}")
 
         with st.expander("View Year-by-Year Retirement Breakdown"):
-            st.dataframe(retirement_breakdown.style.format(
-                {"Annual Expenses": "₹{:,.2f}", "Corpus Required": "₹{:,.2f}"}
-            ))
+            retirement_breakdown['Annual Expenses'] = retirement_breakdown['Annual Expenses'].apply(format_indian_number)
+            retirement_breakdown['Corpus Required'] = retirement_breakdown['Corpus Required'].apply(format_indian_number)
+            st.dataframe(retirement_breakdown)
 
 if __name__ == "__main__":
     main()

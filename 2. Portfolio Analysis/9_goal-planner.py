@@ -17,9 +17,22 @@ def connect_to_db():
     return psycopg.connect(**DB_PARAMS)
 
 def format_indian_currency(amount):
-    """Format amount in lakhs with 2 decimal places"""
-    amount_in_lakhs = float(amount) / 100000
-    return f"₹{amount_in_lakhs:.2f}L"
+    """Format amount in Indian style (with commas for lakhs, crores)"""
+    if pd.isna(amount) or amount == 0:
+        return "₹0"
+    
+    amount = float(amount)
+    is_negative = amount < 0
+    amount = abs(amount)
+    
+    if amount >= 10000000:  # crores
+        return f"₹{'-' if is_negative else ''}{amount/10000000:.2f}Cr"
+    elif amount >= 100000:  # lakhs
+        return f"₹{'-' if is_negative else ''}{amount/100000:.2f}L"
+    elif amount >= 1000:  # thousands
+        return f"₹{'-' if is_negative else ''}{amount/1000:.1f}K"
+    else:
+        return f"₹{'-' if is_negative else ''}{amount:.0f}"
 
 def get_goals():
     """Get list of unique goals from goals table"""
@@ -28,20 +41,59 @@ def get_goals():
         return pd.read_sql(query, conn)['goal_name'].tolist()
 
 def get_current_investments(goal_name):
-    """Get current equity and debt investments for the goal"""
+    """Get current equity and debt investments for the goal with proper value calculation"""
     with connect_to_db() as conn:
+        # Get manual entries (debt investments)
         query = """
         SELECT 
             investment_type,
             SUM(current_value) as total_value
         FROM goals 
-        WHERE goal_name = %s
+        WHERE goal_name = %s AND is_manual_entry = TRUE
         GROUP BY investment_type
         """
-        df = pd.read_sql(query, conn, params=[goal_name])
+        manual_investments = pd.read_sql(query, conn, params=[goal_name])
+        
+        # Get mutual fund investments with current NAV
+        query = """
+        WITH fund_units AS (
+            SELECT 
+                g.scheme_code,
+                SUM(CASE 
+                    WHEN p.transaction_type IN ('switch_out', 'redeem') THEN -p.units
+                    WHEN p.transaction_type IN ('invest', 'switch_in') THEN p.units
+                    ELSE 0 
+                END) as units
+            FROM goals g
+            LEFT JOIN portfolio_data p ON g.scheme_code = p.code
+            WHERE g.goal_name = %s AND g.is_manual_entry = FALSE
+            GROUP BY g.scheme_code
+        ),
+        latest_nav AS (
+            SELECT code, value as nav_value
+            FROM mutual_fund_nav
+            WHERE (code, nav) IN (
+                SELECT code, MAX(nav)
+                FROM mutual_fund_nav
+                GROUP BY code
+            )
+        )
+        SELECT 
+            g.investment_type,
+            SUM(fu.units * ln.nav_value) as total_value
+        FROM goals g
+        JOIN fund_units fu ON g.scheme_code = fu.scheme_code
+        JOIN latest_nav ln ON g.scheme_code = ln.code
+        WHERE g.goal_name = %s AND g.is_manual_entry = FALSE
+        GROUP BY g.investment_type
+        """
+        mf_investments = pd.read_sql(query, conn, params=[goal_name, goal_name])
+        
+        # Combine both manual and MF investments
+        combined = pd.concat([manual_investments, mf_investments])
         
         # Convert to dictionary with types as keys
-        investments = {row['investment_type']: row['total_value'] for _, row in df.iterrows()}
+        investments = {row['investment_type']: row['total_value'] for _, row in combined.iterrows()}
         
         return {
             'equity': investments.get('Equity', 0),
@@ -155,7 +207,7 @@ def create_investment_projection_plot(current_cost, inflation_rate, years,
                             name='Target Amount',
                             line=dict(color='red', dash='dash')))
     
-    # Format y-axis values in lakhs
+    # Format y-axis values
     fig.update_layout(
         title='Retirement Corpus Projection' if is_retirement else 'Investment Projection vs Target',
         xaxis_title='Years',
@@ -163,8 +215,7 @@ def create_investment_projection_plot(current_cost, inflation_rate, years,
         height=500,
         showlegend=True,
         yaxis=dict(
-            tickformat='.2f',
-            ticksuffix='L',
+            tickformat=',.0f',
             tickprefix='₹'
         )
     )
@@ -172,30 +223,6 @@ def create_investment_projection_plot(current_cost, inflation_rate, years,
     return fig
 
 def main():
-    """
-    Main function to run the Investment Goal Planner application.
-    This function sets up the Streamlit page configuration, retrieves the list of goals,
-    and displays a form for the user to input details about their investment goals.
-    Based on the user's input, it calculates the required yearly investments in equity
-    and debt to achieve the goal and displays the results along with an investment projection plot.
-    The function handles both retirement and non-retirement goals and adjusts the input fields
-    and calculations accordingly.
-    The following steps are performed:
-    1. Set up the Streamlit page configuration and title.
-    2. Retrieve the list of goals from the database.
-    3. Display a warning if no goals are found.
-    4. Create an input form for the user to select a goal and input relevant details.
-    5. Retrieve current investments for the selected goal.
-    6. Calculate the future value of the goal or retirement corpus needed.
-    7. Calculate the required yearly investments in equity and debt.
-    8. Display the investment summary and projection plot.
-    9. Display detailed goal planning information in a table.
-    Note: This function relies on several helper functions such as `get_goals`, `get_current_investments`,
-    `calculate_retirement_corpus`, `calculate_future_value`, `calculate_required_investment`,
-    `format_indian_currency`, and `create_investment_projection_plot`.
-    Returns:
-        None
-    """
     st.set_page_config(page_title="Goal Planner", layout="wide")
     st.title("Investment Goal Planner")
     
@@ -221,7 +248,7 @@ def main():
                 current_age = st.number_input("Current Age", min_value=18, max_value=100, value=30)
                 retirement_age = st.number_input("Expected Retirement Age", min_value=current_age, max_value=100, value=60)
                 life_expectancy = st.number_input("Life Expectancy", min_value=retirement_age, max_value=100, value=85)
-                years_to_goal = retirement_age - current_age  # Fixed calculation
+                years_to_goal = retirement_age - current_age
                 current_cost = current_annual_expenses  # For retirement calculations
             else:
                 current_cost = st.number_input("Current Cost of Goal", min_value=0.0, step=100000.0, value=1000000.0)

@@ -26,6 +26,21 @@ def get_portfolio_data():
         """
         return pd.read_sql(query, conn)
 
+def get_latest_nav(portfolio_funds):
+    """Retrieve the latest NAVs for portfolio funds"""
+    with connect_to_db() as conn:
+        query = """
+            SELECT code, scheme_name, nav as date, value as nav_value
+            FROM mutual_fund_nav
+            WHERE (code, nav) IN (
+                SELECT code, MAX(nav) AS latest_date
+                FROM mutual_fund_nav
+                WHERE code = ANY(%s)
+                GROUP BY code
+            )
+        """
+        return pd.read_sql(query, conn, params=(portfolio_funds,))
+
 def get_historical_nav(portfolio_funds):
     """Retrieve historical NAV data"""
     with connect_to_db() as conn:
@@ -37,25 +52,25 @@ def get_historical_nav(portfolio_funds):
         """
         return pd.read_sql(query, conn, params=(portfolio_funds,))
 
-def calculate_fund_metrics(df, historical_nav):
+def calculate_fund_metrics(df, historical_nav, latest_nav):
     """Calculate volatility metrics for each fund"""
-    portfolio_funds = df.groupby('code')['units'].sum()
-    portfolio_funds = portfolio_funds[portfolio_funds > 0].index.tolist()
+    # Get current units for each fund
+    current_units = df.groupby('code')['units'].sum()
+    portfolio_funds = current_units[current_units > 0].index.tolist()
+
+    # Calculate current values using latest NAV
+    current_values = latest_nav.set_index('code')['nav_value'] * current_units
+    total_value = current_values.sum()
+    weights = current_values / total_value
 
     # Calculate returns
     nav_data = historical_nav[historical_nav['code'].isin(portfolio_funds)]
     nav_pivot = nav_data.pivot(index='date', columns='code', values='nav_value')
     daily_returns = nav_pivot.pct_change()
 
-    # Calculate weights
-    current_nav = nav_data.groupby('code')['nav_value'].last()
-    current_units = df.groupby('code')['units'].sum()
-    fund_values = current_nav * current_units
-    total_value = fund_values.sum()
-    weights = fund_values / total_value
-
     # Calculate volatility metrics
     volatility_metrics = pd.DataFrame()
+    volatility_metrics['Current Value'] = current_values
     volatility_metrics['Daily Volatility'] = daily_returns.std()
     volatility_metrics['Annualized Volatility'] = volatility_metrics['Daily Volatility'] * np.sqrt(252)
     volatility_metrics['Weight'] = weights
@@ -78,7 +93,7 @@ def calculate_fund_metrics(df, historical_nav):
     # Risk contribution percentage
     volatility_metrics['Risk Contribution %'] = (tcr / portfolio_volatility) * 100
 
-    return volatility_metrics, correlation_matrix, portfolio_volatility * np.sqrt(252)
+    return volatility_metrics, correlation_matrix, portfolio_volatility * np.sqrt(252), total_value
 
 def analyze_risk_factors(volatility_metrics):
     """Analyze why a fund has high risk contribution"""
@@ -112,6 +127,19 @@ def analyze_risk_factors(volatility_metrics):
 
     return fund_analysis
 
+def format_indian_number(number):
+    """
+    Format a number in Indian style (lakhs, crores)
+    """
+    if number >= 10000000:  # crores
+        return f"₹{number/10000000:.2f} Cr"
+    elif number >= 100000:  # lakhs
+        return f"₹{number/100000:.2f} L"
+    elif number >= 1000:  # thousands
+        return f"₹{number/1000:.2f} K"
+    else:
+        return f"₹{number:.2f}"
+
 def main():
     """
     Main function to run the Portfolio Volatility Analysis application.
@@ -144,22 +172,26 @@ def main():
         portfolio_funds = df.groupby('code')['units'].sum()
         portfolio_funds = portfolio_funds[portfolio_funds > 0].index.tolist()
 
+        latest_nav = get_latest_nav(portfolio_funds)
         historical_nav = get_historical_nav(portfolio_funds)
-        if historical_nav.empty:
+        if historical_nav.empty or latest_nav.empty:
             st.warning("No NAV data found.")
             return
 
         # Calculate metrics
-        volatility_metrics, correlation_matrix, portfolio_volatility = calculate_fund_metrics(df, historical_nav)
+        volatility_metrics, correlation_matrix, portfolio_volatility, total_value = calculate_fund_metrics(df, historical_nav, latest_nav)
 
         # Display Portfolio Overview
-        st.header("Portfolio Risk Overview")
-        col1, col2 = st.columns(2)
+        st.header("Portfolio Overview")
+        col1, col2, col3 = st.columns(3)
 
         with col1:
-            st.metric("Portfolio Annualized Volatility", f"{portfolio_volatility:.2f}%")
+            st.metric("Total Portfolio Value", format_indian_number(total_value))
 
         with col2:
+            st.metric("Portfolio Annualized Volatility", f"{portfolio_volatility:.2f}%")
+
+        with col3:
             highest_risk_fund = volatility_metrics['Risk Contribution %'].idxmax()
             st.metric(
                 "Highest Risk Contribution", 
@@ -170,34 +202,49 @@ def main():
         # Individual Fund Analysis
         st.header("Individual Fund Analysis")
 
-        fund_metrics = volatility_metrics.copy()
-        fund_metrics.index = [historical_nav[historical_nav['code'] == code]['scheme_name'].iloc[0] 
-                            for code in fund_metrics.index]
+        # Get scheme names for display
+        scheme_names = historical_nav.drop_duplicates('code').set_index('code')['scheme_name']
+        volatility_metrics['Scheme Name'] = volatility_metrics.index.map(scheme_names)
+        volatility_metrics = volatility_metrics.set_index('Scheme Name')
 
         # Add Primary Risk Factor Analysis
         risk_factors = analyze_risk_factors(volatility_metrics)
-        fund_metrics['Primary Risk Factor'] = [risk_factors[code]['primary_factor'] for code in volatility_metrics.index]
+        volatility_metrics['Primary Risk Factor'] = [risk_factors[code]['primary_factor'] for code in volatility_metrics.index]
 
         # Format metrics for display
-        display_metrics = fund_metrics.copy()
+        display_metrics = volatility_metrics.copy()
+        display_metrics['Current Value'] = display_metrics['Current Value'].apply(format_indian_number)
         for col in ['Daily Volatility', 'Annualized Volatility', 'MCR', 'TCR', 'Risk Contribution %']:
             display_metrics[col] = display_metrics[col].map('{:.2f}%'.format)
         display_metrics['Weight'] = display_metrics['Weight'].map('{:.2f}%'.format)
 
+        # Reorder columns for better display
+        display_metrics = display_metrics[[
+            'Current Value', 'Weight', 'Daily Volatility', 'Annualized Volatility',
+            'Risk Contribution %', 'Primary Risk Factor'
+        ]]
+
         st.dataframe(display_metrics)
 
-        st.info("**How to Interpret the Results:**\n- **Weight:** Proportion of portfolio value held in the fund.\n- **Annualized Volatility:** Risk level of the fund.\n- **Risk Contribution %:** Indicates the fund's contribution to overall portfolio risk.\n- **Primary Risk Factor:** Highlights whether the fund's weight or volatility drives its risk contribution.")
+        st.info("""
+        **How to Interpret the Results:**
+        - **Current Value:** Current market value of the fund holding
+        - **Weight:** Proportion of portfolio value held in the fund
+        - **Annualized Volatility:** Risk level of the fund
+        - **Risk Contribution %:** Indicates the fund's contribution to overall portfolio risk
+        - **Primary Risk Factor:** Highlights whether the fund's weight or volatility drives its risk contribution
+        """)
 
         # Risk Contribution Visualization
         st.header("Risk Contribution Analysis")
 
         fig = go.Figure(data=[
             go.Bar(name='Weight', 
-                  x=fund_metrics.index, 
-                  y=fund_metrics['Weight'] * 100),
+                  x=display_metrics.index, 
+                  y=volatility_metrics['Weight'] * 100),
             go.Bar(name='Risk Contribution', 
-                  x=fund_metrics.index, 
-                  y=fund_metrics['Risk Contribution %'])
+                  x=display_metrics.index, 
+                  y=volatility_metrics['Risk Contribution %'])
         ])
 
         fig.update_layout(
@@ -214,8 +261,7 @@ def main():
         st.header("Fund Correlation Analysis")
 
         correlation_display = correlation_matrix.copy()
-        correlation_display.index = [historical_nav[historical_nav['code'] == code]['scheme_name'].iloc[0] 
-                                   for code in correlation_display.index]
+        correlation_display.index = correlation_display.index.map(scheme_names)
         correlation_display.columns = correlation_display.index
 
         fig = px.imshow(correlation_display,
