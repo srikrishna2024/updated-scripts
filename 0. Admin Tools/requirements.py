@@ -13,9 +13,10 @@ def get_imports_from_file(filepath):
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     for alias in node.names:
-                        imports.add(alias.name)
+                        imports.add(alias.name.split('.')[0])  # Only take the base package name
                 elif isinstance(node, ast.ImportFrom):
-                    imports.add(node.module)
+                    if node.module:  # Some ImportFrom nodes might have module=None
+                        imports.add(node.module.split('.')[0])  # Only take the base package name
     except Exception as e:
         print(f"Error reading file {filepath}: {e}")
         
@@ -33,7 +34,7 @@ def scan_folder_for_python_files(folder_path):
     
     return python_files
 
-def generate_requirements_txt(folder_path):
+def generate_requirements_txt(folder_path, output_path):
     """Generate a requirements.txt file for all Python dependencies."""
     all_imports = set()
     
@@ -52,42 +53,62 @@ def generate_requirements_txt(folder_path):
             print(f"Found imports in {python_file}: {imports}")
         all_imports.update(imports)
     
+    # Filter out standard library modules
+    stdlib_modules = set(sys.builtin_module_names)
+    external_imports = sorted([imp for imp in all_imports if imp not in stdlib_modules])
+    
     # Create a requirements.txt file with the list of unique imports
-    if all_imports:
-        with open('requirements.txt', 'w') as req_file:
-            for imp in sorted(all_imports):
+    if external_imports:
+        requirements_path = os.path.join(output_path, 'requirements.txt')
+        with open(requirements_path, 'w') as req_file:
+            for imp in external_imports:
                 req_file.write(f'{imp}\n')
-        print(f"requirements.txt has been generated with the following dependencies:")
-        for imp in sorted(all_imports):
-            print(imp)
+        print(f"\nrequirements.txt has been generated at {requirements_path} with the following dependencies:")
+        for imp in external_imports:
+            print(f"- {imp}")
     else:
-        print("No imports were found in any Python files.")
+        print("\nNo external imports were found in any Python files.")
 
-def install_requirements():
+def install_requirements(output_path):
     """Install all packages listed in requirements.txt."""
+    requirements_path = os.path.join(output_path, 'requirements.txt')
+    if not os.path.exists(requirements_path):
+        print(f"\nError: {requirements_path} not found. Please generate it first.")
+        return
+    
     print("\nInstalling dependencies from requirements.txt...")
     try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", requirements_path])
         print("All dependencies have been successfully installed.")
     except subprocess.CalledProcessError as e:
         print(f"Error installing dependencies: {e}")
 
 def main():
-    # Replace this with the path to the folder containing your scripts
-    folder_path = os.path.dirname(os.path.abspath(__file__))  # Get the folder where the script is located
+    # Get the folder where the script is located for output
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Ask user for source folder path
+    print("Python Dependency Scanner")
+    print("------------------------")
+    folder_path = input("Enter the path to scan for Python files: ").strip()
+    
+    # Validate the folder path
+    if not os.path.isdir(folder_path):
+        print(f"\nError: The path '{folder_path}' is not a valid directory.")
+        return
     
     # Ask the user for their choice
-    print("Choose an option:")
+    print("\nChoose an option:")
     print("1. Generate requirements.txt file")
     print("2. Generate requirements.txt file and install all packages")
     
     user_choice = input("Enter the number (1 or 2): ").strip()
 
     if user_choice == '1':
-        generate_requirements_txt(folder_path)
+        generate_requirements_txt(folder_path, script_dir)
     elif user_choice == '2':
-        generate_requirements_txt(folder_path)
-        install_requirements()
+        generate_requirements_txt(folder_path, script_dir)
+        install_requirements(script_dir)
     else:
         print("Invalid option. Please choose either 1 or 2.")
 

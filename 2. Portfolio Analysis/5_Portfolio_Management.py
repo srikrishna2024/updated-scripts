@@ -222,28 +222,37 @@ def initialize_database():
                         END) AS total_investment
                     FROM portfolio_data
                     GROUP BY code, scheme_name
+                ),
+                latest_nav AS (
+                    SELECT 
+                        code,
+                        value,
+                        nav
+                    FROM (
+                        SELECT 
+                            code,
+                            value,
+                            nav,
+                            ROW_NUMBER() OVER (PARTITION BY code ORDER BY nav DESC) as rn
+                        FROM mutual_fund_nav
+                    ) t
+                    WHERE rn = 1
                 )
                 SELECT 
                     t.code,
                     t.scheme_name,
                     t.current_units,
-                    COALESCE(m.value, 0) AS latest_nav,
+                    COALESCE(l.value, 0) AS latest_nav,
                     CASE 
-                        WHEN t.current_units > 0 THEN t.current_units * COALESCE(m.value, 0)
+                        WHEN t.current_units > 0 THEN t.current_units * COALESCE(l.value, 0)
                         ELSE 0
                     END AS current_value,
-                    m.nav AS nav_date,
+                    l.nav AS nav_date,
                     t.total_investment
                 FROM transaction_summary t
-                LEFT JOIN LATERAL (
-                    SELECT value, nav
-                    FROM mutual_fund_nav
-                    WHERE code = t.code
-                    ORDER BY nav DESC
-                    LIMIT 1
-                ) m ON true
+                LEFT JOIN latest_nav l ON t.code = l.code
                 WHERE t.current_units > 0
-                ORDER BY t.current_units * COALESCE(m.value, 0) DESC;
+                ORDER BY t.current_units * COALESCE(l.value, 0) DESC;
             """)
             conn.commit()
             
