@@ -2,6 +2,7 @@ import os
 import psycopg
 import requests
 from datetime import datetime
+import time
 
 LOG_FILE = "last_downloaded_scheme.log"
 
@@ -51,7 +52,25 @@ def create_nav_table_if_not_exists(cursor):
         """)
         print("Constraint 'unique_code_nav' added.")
 
-def fetch_open_ended_schemes(cursor):
+def fetch_new_open_ended_schemes(cursor):
+    """
+    Fetches all open-ended schemes that exist in master_data but not in nav table.
+    """
+    cursor.execute("""
+        SELECT mf.code, mf.scheme_name
+        FROM mutual_fund_master_data mf
+        WHERE mf.scheme_type = 'Open Ended'
+        AND NOT EXISTS (
+            SELECT 1
+            FROM mutual_fund_nav nav
+            WHERE nav.code = mf.code
+        );
+    """)
+    schemes = cursor.fetchall()
+    print(f"Fetched {len(schemes)} new open-ended schemes without NAV data.")
+    return schemes
+
+def fetch_all_open_ended_schemes(cursor):
     """Fetches all open-ended schemes."""
     cursor.execute("""
         SELECT code, scheme_name
@@ -69,42 +88,90 @@ def fetch_nav_data(scheme_code, retries=3):
         try:
             response = requests.get(api_url, timeout=10)
             if response.status_code == 200:
-                return response.json()
+                data = response.json()
+                if 'data' in data and data['data']:
+                    return data
+                else:
+                    print(f"Empty data received for scheme {scheme_code}")
             else:
-                print(f"Failed to fetch NAV data for scheme {scheme_code}: {response.status_code}")
+                print(f"Failed to fetch NAV data for scheme {scheme_code}: Status {response.status_code}")
         except requests.exceptions.RequestException as e:
             print(f"Error fetching NAV data for scheme {scheme_code}: {e}")
-            if attempt < retries - 1:
-                print("Retrying...")
+        
+        if attempt < retries - 1:
+            print(f"Retrying... (Attempt {attempt + 1} of {retries})")
+            time.sleep(1)  # Add a small delay between retries
+    
     return None
 
-def update_nav_data(cursor, schemes, limit=None, offset=0):
+def update_nav_data(cursor, connection, schemes, limit=None, offset=0):
     """Updates NAV data for the given list of schemes."""
     schemes_to_fetch = schemes[offset:offset+limit] if limit else schemes
     updated_count = 0
+    inserted_count = 0
+    skipped_count = 0
     last_successful_scheme = None
 
-    for scheme in schemes_to_fetch:
+    for i, scheme in enumerate(schemes_to_fetch):
         scheme_code, scheme_name = scheme
-        print(f"Processing scheme: {scheme_code} - {scheme_name}")
+        print(f"Processing scheme {i+1}/{len(schemes_to_fetch)}: {scheme_code} - {scheme_name}")
+        
         nav_data = fetch_nav_data(scheme_code)
-        if nav_data and 'data' in nav_data:
+        if nav_data and 'data' in nav_data and nav_data['data']:
+            entries_added = 0
+            # Check if this scheme already has entries
+            cursor.execute("SELECT COUNT(*) FROM mutual_fund_nav WHERE code = %s", (scheme_code,))
+            existing_count = cursor.fetchone()[0]
+            
             for nav_entry in nav_data['data']:
                 nav_date = parse_date(nav_entry['date'])
                 if not nav_date:
                     continue
-                nav_value = float(nav_entry['nav'])
-                cursor.execute("""
-                    INSERT INTO mutual_fund_nav (code, scheme_name, nav, value)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT ON CONSTRAINT unique_code_nav DO NOTHING;
-                """, (scheme_code, scheme_name, nav_date, nav_value))
+                
+                try:
+                    nav_value = float(nav_entry['nav'])
+                    cursor.execute("""
+                        INSERT INTO mutual_fund_nav (code, scheme_name, nav, value)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT ON CONSTRAINT unique_code_nav DO NOTHING
+                        RETURNING id;
+                    """, (scheme_code, scheme_name, nav_date, nav_value))
+                    
+                    # Check if a row was inserted
+                    result = cursor.fetchone()
+                    if result:
+                        entries_added += 1
+                except Exception as e:
+                    print(f"Error inserting NAV data for {scheme_code} on {nav_date}: {e}")
+            
+            # Commit after each scheme to save progress
+            connection.commit()
+            
+            if entries_added > 0:
+                print(f"Added {entries_added} NAV entries for scheme {scheme_code}")
+                inserted_count += 1
+            elif existing_count > 0:
+                print(f"Scheme {scheme_code} already had data, no new entries added")
+                skipped_count += 1
+            else:
+                print(f"No new NAV entries added for scheme {scheme_code}")
+                skipped_count += 1
+                
             updated_count += 1
             last_successful_scheme = scheme_code
             write_last_downloaded_scheme(last_successful_scheme)
         else:
-            print(f"No NAV data found for scheme {scheme_code}.")
-    print(f"Updated NAV data for {updated_count} schemes.")
+            print(f"No valid NAV data found for scheme {scheme_code}.")
+            skipped_count += 1
+        
+        # Add a small delay to avoid overwhelming the API
+        time.sleep(0.2)
+    
+    print(f"Process summary:")
+    print(f"Total schemes processed: {updated_count}")
+    print(f"Schemes with new data inserted: {inserted_count}")
+    print(f"Schemes skipped or with no new data: {skipped_count}")
+    
     return last_successful_scheme
 
 def read_last_downloaded_scheme():
@@ -117,7 +184,17 @@ def read_last_downloaded_scheme():
 def write_last_downloaded_scheme(scheme_code):
     """Writes the last downloaded scheme code to the log file."""
     with open(LOG_FILE, "w") as file:
-        file.write(scheme_code)
+        file.write(str(scheme_code))
+
+def verify_scheme_update(cursor, scheme_code):
+    """Verifies if a scheme has entries in the NAV table."""
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM mutual_fund_nav
+        WHERE code = %s;
+    """, (scheme_code,))
+    count = cursor.fetchone()[0]
+    return count > 0
 
 def nav_updater(db_config):
     """
@@ -129,18 +206,9 @@ def nav_updater(db_config):
             - 'password': The password used to authenticate.
             - 'host': The host address of the database.
             - 'port': The port number on which the database is listening.
-    The function performs the following steps:
-        1. Connects to the PostgreSQL database using the provided configuration.
-        2. Ensures that the NAV table exists in the database.
-        3. Fetches all eligible open-ended mutual fund schemes.
-        4. Prompts the user to choose an update option:
-            - Update all schemes.
-            - Update 5000 schemes starting from the last downloaded scheme.
-            - Update a specific scheme based on the scheme code.
-        5. Updates the NAV data based on the user's choice.
-        6. Commits the transaction to the database.
-    Raises:
-        Exception: If any error occurs during the database connection or data update process, it prints the error message.
+    
+    The function now has an additional option to identify and update only new schemes
+    that exist in the master data table but not in the NAV table.
     """
     try:
         # Connect to the PostgreSQL database
@@ -154,17 +222,22 @@ def nav_updater(db_config):
             with connection.cursor() as cursor:
                 # Ensure NAV table exists
                 create_nav_table_if_not_exists(cursor)
-
-                # Fetch eligible schemes
-                all_schemes = fetch_open_ended_schemes(cursor)
+                connection.commit()
 
                 # Get user's choice
-                print("Choose an option:\n1. Update all schemes\n2. Update 5000 schemes\n3. Update a specific scheme")
-                choice = input("Enter your choice (1/2/3): ")
+                print("Choose an option:")
+                print("1. Update all open-ended schemes")
+                print("2. Update 5000 schemes from last position")
+                print("3. Update a specific scheme")
+                print("4. Update only new schemes (in master data but not in NAV table)")
+                print("5. Verify a specific scheme has NAV data")
+                choice = input("Enter your choice (1/2/3/4/5): ")
 
                 if choice == "1":
-                    update_nav_data(cursor, all_schemes)
+                    all_schemes = fetch_all_open_ended_schemes(cursor)
+                    update_nav_data(cursor, connection, all_schemes)
                 elif choice == "2":
+                    all_schemes = fetch_all_open_ended_schemes(cursor)
                     # Determine the starting point
                     last_downloaded_scheme = read_last_downloaded_scheme()
                     if last_downloaded_scheme:
@@ -173,24 +246,43 @@ def nav_updater(db_config):
                         offset = 0
                     
                     limit = 5000
-                    last_scheme = update_nav_data(cursor, all_schemes, limit=limit, offset=offset)
+                    print(f"Starting from position {offset} (after scheme {last_downloaded_scheme})")
+                    last_scheme = update_nav_data(cursor, connection, all_schemes, limit=limit, offset=offset)
                     if last_scheme:
                         write_last_downloaded_scheme(last_scheme)
                 elif choice == "3":
+                    all_schemes = fetch_all_open_ended_schemes(cursor)
                     scheme_code = input("Enter the scheme code: ")
                     specific_scheme = [scheme for scheme in all_schemes if scheme[0] == scheme_code]
                     if specific_scheme:
-                        update_nav_data(cursor, specific_scheme)
+                        update_nav_data(cursor, connection, specific_scheme)
                     else:
                         print(f"No scheme found with code {scheme_code}.")
+                elif choice == "4":
+                    # Option to update only schemes that don't have NAV data
+                    new_schemes = fetch_new_open_ended_schemes(cursor)
+                    if new_schemes:
+                        print(f"Found {len(new_schemes)} new schemes without NAV data. Updating...")
+                        update_nav_data(cursor, connection, new_schemes)
+                    else:
+                        print("No new schemes found that need NAV updates.")
+                elif choice == "5":
+                    # Verify a specific scheme
+                    scheme_code = input("Enter the scheme code to verify: ")
+                    has_data = verify_scheme_update(cursor, scheme_code)
+                    if has_data:
+                        print(f"Scheme {scheme_code} has NAV data in the database.")
+                    else:
+                        print(f"Scheme {scheme_code} does NOT have any NAV data in the database.")
                 else:
                     print("Invalid choice. Exiting.")
 
-                connection.commit()
                 print("NAV update completed.")
 
     except Exception as e:
         print(f"An error occurred: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     DB_PARAMS = {
