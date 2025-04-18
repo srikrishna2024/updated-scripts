@@ -33,7 +33,7 @@ def get_portfolio_data():
     """Retrieve all records from portfolio_data table"""
     with connect_to_db() as conn:
         query = """
-            SELECT date, scheme_name, code, transaction_type, value, units, amount 
+            SELECT date, scheme_name, code, transaction_type, nav_value, units, amount 
             FROM portfolio_data 
             ORDER BY date, scheme_name
         """
@@ -48,7 +48,7 @@ def get_latest_nav(portfolio_funds):
     """Retrieve the latest NAVs for portfolio funds"""
     with connect_to_db() as conn:
         query = """
-            SELECT code, scheme_name, nav as date, value
+            SELECT code, scheme_name, nav as date, nav_value
             FROM mutual_fund_nav
             WHERE (code, nav) IN (
                 SELECT code, MAX(nav) AS latest_date
@@ -63,7 +63,7 @@ def get_historical_nav(portfolio_funds):
     """Retrieve historical NAV data for portfolio funds"""
     with connect_to_db() as conn:
         query = """
-            SELECT code, scheme_name, nav as date, value
+            SELECT code, scheme_name, nav as date, nav_value
             FROM mutual_fund_nav
             WHERE code = ANY(%s)
             ORDER BY code, nav
@@ -108,10 +108,10 @@ def calculate_portfolio_weights(df, latest_nav):
     current_units = current_units[current_units['units'] > 0]
     
     # Merge with latest NAV data
-    current_value_df = current_units.merge(latest_nav[['code', 'value']], on='code', how='left')
+    current_value_df = current_units.merge(latest_nav[['code', 'nav_value']], on='code', how='left')
     
     # Calculate current value for each fund
-    current_value_df['current_value'] = current_value_df['units'] * current_value_df['value']
+    current_value_df['current_value'] = current_value_df['units'] * current_value_df['nav_value']
     
     # Calculate total portfolio value
     total_value = current_value_df['current_value'].sum()
@@ -134,7 +134,7 @@ def calculate_xirr(df, latest_nav, portfolio_funds):
             if not scheme_nav.empty:
                 # Calculate current value of the scheme
                 current_units = scheme_data['units'].sum()
-                latest_value = current_units * scheme_nav['value'].iloc[0]
+                latest_value = current_units * scheme_nav['nav_value'].iloc[0]
                 
                 # Prepare cashflows for XIRR calculation
                 final_cf = pd.DataFrame({
@@ -165,7 +165,7 @@ def calculate_xirr(df, latest_nav, portfolio_funds):
             latest_nav_dates = pd.read_sql(query, conn, params=(portfolio_funds, date))
             
             query = """
-                SELECT code, value
+                SELECT code, nav_value
                 FROM mutual_fund_nav
                 WHERE (code, nav) IN (
                     SELECT code, MAX(nav) as latest_nav_date
@@ -180,7 +180,7 @@ def calculate_xirr(df, latest_nav, portfolio_funds):
         transactions_to_date = transactions_to_date.merge(nav_values, on='code', how='left')
         
         # Calculate current value for each transaction
-        transactions_to_date['current_value'] = transactions_to_date['units'] * transactions_to_date['value']
+        transactions_to_date['current_value'] = transactions_to_date['units'] * transactions_to_date['nav_value']
         
         # Sum up the values for the date
         total_value = transactions_to_date.groupby('date')['current_value'].sum().loc[date]
@@ -190,8 +190,8 @@ def calculate_xirr(df, latest_nav, portfolio_funds):
     if not df.empty:
         # Calculate current portfolio value
         current_units = df.groupby('code')['units'].sum().reset_index()
-        current_units = current_units.merge(latest_nav[['code', 'value']], on='code', how='left')
-        current_units['current_value'] = current_units['units'] * current_units['value']
+        current_units = current_units.merge(latest_nav[['code', 'nav_value']], on='code', how='left')
+        current_units['current_value'] = current_units['units'] * current_units['nav_value']
         final_portfolio_value = current_units['current_value'].sum()
         
         # Prepare cashflows
@@ -210,7 +210,7 @@ def calculate_xirr(df, latest_nav, portfolio_funds):
 def calculate_returns(nav_data, portfolio_funds):
     """Calculate historical returns for portfolio funds"""
     nav_data = nav_data[nav_data['code'].isin(portfolio_funds)]
-    nav_pivot = nav_data.pivot(index='date', columns='code', values='value')
+    nav_pivot = nav_data.pivot(index='date', columns='code', values='nav_value')
     daily_returns = nav_pivot.pct_change()
     monthly_returns = nav_pivot.resample('M').last().pct_change()
     
