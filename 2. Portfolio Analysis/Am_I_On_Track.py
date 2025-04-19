@@ -77,16 +77,35 @@ if goals_df.empty:
 # Input
 selected_goal = st.selectbox("Select Goal", goals_df['goal_name'].unique())
 target_amount = st.number_input("Target Amount (₹)", value=1000000, step=10000)
-target_date = st.date_input("Target Date", value=datetime(2030, 3, 31))
+target_date = st.date_input("Target Date", value=datetime(2030, 3, 31), max_value=datetime(2200, 12, 31))
+
 
 # Projected annual investments section
 with st.expander("📅 Projected Future Investments"):
     projected_annual_investment = st.number_input("Annual Investment till Target Date (₹)", value=60000, step=10000)
-    investment_growth_rate = st.slider("Expected Annual Return for Your Fund (%)", 5, 20, 12)
-    benchmark_growth_rate = st.slider("Expected Benchmark Return (%)", 5, 20, 10)
+    return_type = st.radio("Choose Return Type", ["Fixed", "Variable"])
+
+    years_left = (target_date - datetime.today().date()).days // 365
+    investment_growth_rate, benchmark_growth_rate, variable_returns, scenario = None, None, None, None
+
+    if return_type == "Fixed":
+        investment_growth_rate = st.slider("Expected Annual Return for Your Fund (%)", 5, 20, 12)
+        benchmark_growth_rate = st.slider("Expected Benchmark Return (%)", 5, 20, 10)
+    else:
+        scenario = st.selectbox("Choose Return Scenario", ["Optimistic", "Neutral", "Conservative", "Worst Case"])
+        if scenario == "Optimistic":
+            variable_returns = [12 - i * 0.5 for i in range(years_left)]
+        elif scenario == "Neutral":
+            variable_returns = [10 - i * 0.5 for i in range(years_left)]
+        elif scenario == "Conservative":
+            variable_returns = [8 - i * 0.5 for i in range(years_left)]
+        else:
+            variable_returns = [6 - i * 0.25 for i in range(years_left)]
+
     analyze_investments = st.button("Analyze Projected Investments")
 
 # What-If Analysis section
+
 with st.expander("🧪 What-If Analysis"):
     st.markdown("""
     **How to use this:**
@@ -118,17 +137,46 @@ if analyze_investments:
     st.metric("Current Value", format_inr(current_value))
     st.progress(progress)
 
+    
     st.subheader("🚩 Milestone Tracker")
     milestones = [25, 50, 75, 100]
-    dates = milestone_dates(current_value, target_amount, target_date, milestones)
-    for i, m in enumerate(milestones):
-        st.write(f"{m}% = {format_inr(target_amount * m / 100)} by {dates[i]}")
+
+    if return_type == "Fixed":
+        dates = milestone_dates(current_value, target_amount, target_date, milestones)
+        for i, m in enumerate(milestones):
+            st.write(f"{m}% = {format_inr(target_amount * m / 100)} by {dates[i]}")
+    else:
+        st.markdown(f"**Scenario: {scenario}**")
+        projected_value = current_value
+        milestone_reached = {}
+        for year_idx, r in enumerate(variable_returns):
+            projected_value *= (1 + r / 100)
+            for m in milestones:
+                if m not in milestone_reached and projected_value >= (target_amount * m / 100):
+                    est_date = datetime.today() + pd.DateOffset(years=year_idx + 1)
+                    milestone_reached[m] = est_date.strftime('%b %Y')
+        for m in milestones:
+            date_text = milestone_reached.get(m, "Not Reached")
+            st.write(f"{m}% = {format_inr(target_amount * m / 100)} by {date_text}")
 
     st.subheader("📊 Am I On Track?")
+    
     years_left = (target_date - datetime.today().date()).days / 365
-    future_fund_value = current_value * ((1 + investment_growth_rate / 100) ** years_left)
-    future_contributions = projected_annual_investment * (((1 + investment_growth_rate / 100) ** years_left - 1) / (investment_growth_rate / 100))
+    
+    if return_type == "Fixed":
+        future_fund_value = current_value * ((1 + investment_growth_rate / 100) ** years_left)
+        future_contributions = projected_annual_investment * (((1 + investment_growth_rate / 100) ** years_left - 1) / (investment_growth_rate / 100))
+    else:
+        fund = current_value
+        contrib = 0
+        for r in variable_returns:
+            fund *= (1 + r / 100)
+            contrib = (contrib + projected_annual_investment) * (1 + r / 100)
+        future_fund_value = fund
+        future_contributions = contrib
+
     projected_total = future_fund_value + future_contributions
+    
 
     if projected_total >= target_amount:
         st.success(f"✅ On Track! Projected Corpus: {format_inr(projected_total)}")
@@ -141,19 +189,56 @@ if analyze_investments:
     benchmark['date'] = pd.to_datetime(benchmark['date'])
 
     fund_chart = transactions.groupby('date')['amount'].sum().cumsum().reset_index(name='Your Fund')
-    benchmark_chart = benchmark.rename(columns={'price': 'Benchmark'})
-    merged = pd.merge(fund_chart, benchmark_chart, on='date', how='inner')
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=merged['date'], y=merged['Your Fund'], mode='lines', name='Your Fund'))
-    fig.add_trace(go.Scatter(x=merged['date'], y=merged['Benchmark'], mode='lines', name='Nifty50 TRI'))
-    fig.update_layout(
-        title='Fund vs Benchmark Over Time',
-        xaxis_title='Date',
-        yaxis_title='Value (₹)',
-        height=400
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    # Normalize benchmark to same initial investment
+    if not fund_chart.empty and not benchmark.empty:
+        initial_investment = fund_chart['Your Fund'].iloc[0]
+        benchmark = benchmark[benchmark['date'].between(fund_chart['date'].min(), fund_chart['date'].max())]
+        benchmark['Benchmark'] = benchmark['price'] / benchmark['price'].iloc[0] * initial_investment
+        benchmark_chart = benchmark[['date', 'Benchmark']]
+        merged = pd.merge(fund_chart, benchmark_chart, on='date', how='inner')
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=merged['date'], y=merged['Your Fund'], mode='lines', name='Your Fund'))
+        fig.add_trace(go.Scatter(x=merged['date'], y=merged['Benchmark'], mode='lines', name='Nifty50 TRI'))
+
+        # Add vertical milestone lines by date
+        milestone_dates_list = milestone_dates(current_value, target_amount, target_date, [25, 50, 75, 100])
+        for i, m in enumerate([25, 50, 75, 100]):
+            try:
+                milestone_date = pd.to_datetime(milestone_dates_list[i])
+                fig.add_vline(x=milestone_date, line_dash="dash", line_color="grey")
+                fig.add_annotation(
+                    x=milestone_date,
+                    y=max(merged['Your Fund'].max(), merged['Benchmark'].max()),
+                    text=f"{m}% Milestone",
+                    showarrow=False,
+                    yanchor="bottom",
+                    bgcolor="white",
+                    font=dict(size=10)
+                )
+            except:
+                pass
+
+        
+        # Add future scenario projection line if applicable
+        if return_type == "Variable" and variable_returns:
+            future_dates = pd.date_range(start=datetime.today(), periods=len(variable_returns), freq='Y')
+            projected_value = current_value
+            future_values = []
+            for r in variable_returns:
+                projected_value *= (1 + r / 100)
+                future_values.append(projected_value)
+            fig.add_trace(go.Scatter(x=future_dates, y=future_values, mode='lines+markers', name='Projected (Scenario)', line=dict(dash='dot')))
+
+        fig.update_layout(
+            title='Fund vs Benchmark Over Time',
+            xaxis_title='Date',
+            yaxis_title='Value (₹)',
+            height=400
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    
 
 # Run What-If Scenario independently
 if analyze_what_if:
