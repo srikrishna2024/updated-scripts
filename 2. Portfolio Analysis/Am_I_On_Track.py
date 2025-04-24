@@ -178,10 +178,47 @@ if analyze_investments:
     projected_total = future_fund_value + future_contributions
     
 
+    
     if projected_total >= target_amount:
         st.success(f"✅ On Track! Projected Corpus: {format_inr(projected_total)}")
     else:
         st.warning(f"⚠️ Off Track! Shortfall: {format_inr(target_amount - projected_total)}")
+
+    st.markdown(f"**📈 Projected Value till {target_date.strftime('%b %Y')}: {format_inr(projected_total)}**")
+
+    # Suggest year when target can be reached and required investment if not reached
+    if return_type == "Variable" and variable_returns:
+        projected_value = current_value
+        contrib = 0
+        target_year = "Not reached within selected timeline"
+        required_investment = None
+        for idx, r in enumerate(variable_returns):
+            projected_value *= (1 + r / 100)
+            contrib = (contrib + projected_annual_investment) * (1 + r / 100)
+            if (projected_value + contrib) >= target_amount and target_year == "Not reached within selected timeline":
+                est_date = datetime.today() + pd.DateOffset(years=idx + 1)
+                target_year = est_date.strftime('%Y')
+                break
+
+        st.markdown(f"🎯 **Target can be reached by:** {target_year}" if target_year != "Not reached within selected timeline" else "🚫 **Target not reachable in current timeline**")
+
+        if (projected_value + contrib) < target_amount:
+            required = target_amount
+            # Try estimating required investment with current returns
+            inv_guess = projected_annual_investment
+            for _ in range(10):
+                contrib_est = 0
+                fund_est = current_value
+                for r in variable_returns:
+                    fund_est *= (1 + r / 100)
+                    contrib_est = (contrib_est + inv_guess) * (1 + r / 100)
+                if (fund_est + contrib_est) >= required:
+                    break
+                inv_guess += 1000
+
+            st.markdown(f"💡 **Suggested Annual Investment to reach target:** ₹{inv_guess:,.0f}")
+
+
 
     st.subheader("📈 Performance Comparison")
     benchmark = get_benchmark()
@@ -234,10 +271,20 @@ if analyze_investments:
         fig.update_layout(
             title='Fund vs Benchmark Over Time',
             xaxis_title='Date',
-            yaxis_title='Value (₹)',
+            yaxis_title="Value (₹ in Cr)", yaxis=dict(type="log", tickformat=".2r"),
             height=400
         )
         st.plotly_chart(fig, use_container_width=True)
+        # Show variable returns table
+        if return_type == "Variable" and variable_returns:
+            st.subheader("📅 Variable Return Projections")
+            variable_returns_df = pd.DataFrame({
+                "Year": list(range(1, len(variable_returns) + 1)),
+                "Expected Return (%)": variable_returns
+            })
+            variable_returns_df["Projected Value (₹ in Cr)"] = [round(val / 1e7, 2) for val in future_values]
+            st.dataframe(variable_returns_df)
+
     
 
 # Run What-If Scenario independently
