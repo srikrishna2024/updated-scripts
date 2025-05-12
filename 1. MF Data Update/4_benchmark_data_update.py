@@ -76,6 +76,9 @@ def preprocess_csv(csv_path):
     try:
         # Read CSV file
         data = pd.read_csv(csv_path)
+        
+        # Drop empty rows
+        data = data.dropna(how='all')
         data = data.fillna(0)
         data.columns = data.columns.str.lower().str.replace(' ', '_')
         
@@ -83,31 +86,19 @@ def preprocess_csv(csv_path):
         if 'date' not in data.columns:
             raise ValueError("CSV file must contain a 'date' column")
             
-        # Try parsing dates with different formats
-        date_formats = ['%d-%m-%Y', '%d/%m/%Y', '%m/%d/%Y', '%Y/%m/%d', '%Y-%m-%d']
-        date_parsed = False
-        
-        for date_format in date_formats:
+        # Convert string dates to datetime objects - handle US format (MM/DD/YYYY)
+        try:
+            data['date'] = pd.to_datetime(data['date'], format='%m/%d/%Y')
+        except ValueError:
             try:
-                # Convert string dates to datetime objects
-                data['date'] = pd.to_datetime(data['date'], format=date_format, dayfirst=True)
-                if not data['date'].isna().all():
-                    date_parsed = True
-                    break
-            except (ValueError, TypeError):
-                continue
-        
-        if not date_parsed:
-            # Try pandas' flexible parser as a last resort
-            try:
-                data['date'] = pd.to_datetime(data['date'], dayfirst=True)
-                date_parsed = True
-            except (ValueError, TypeError):
-                pass
+                data['date'] = pd.to_datetime(data['date'], format='%d/%m/%Y')
+            except ValueError:
+                # Try pandas' flexible parser as a last resort
+                try:
+                    data['date'] = pd.to_datetime(data['date'])
+                except ValueError as e:
+                    raise ValueError(f"Could not parse dates: {str(e)}. Please check the date format in your CSV file.")
                 
-        if not date_parsed:
-            raise ValueError("Could not parse dates. Please check the date format in your CSV file.")
-            
         # Remove any rows with invalid dates
         invalid_dates = data['date'].isna().sum()
         if invalid_dates > 0:
@@ -122,15 +113,16 @@ def preprocess_csv(csv_path):
         for column in numeric_columns:
             if column in data.columns:
                 # Handle various numeric formats
-                data[column] = (data[column].astype(str)
-                              .str.replace(',', '')  # Remove thousands separator
-                              .str.replace('₹', '')  # Remove rupee symbol if present
-                              .str.replace('$', '')  # Remove dollar symbol if present
-                              .str.replace('%', '')  # Remove percentage symbol
-                              .str.strip())          # Remove whitespace
-                              
-                # Convert to float, replacing invalid values with 0
-                data[column] = pd.to_numeric(data[column], errors='coerce').fillna(0)
+                if data[column].dtype == object:
+                    data[column] = (data[column].astype(str)
+                                  .str.replace(',', '')  # Remove thousands separator
+                                  .str.replace('₹', '')  # Remove rupee symbol if present
+                                  .str.replace('$', '')  # Remove dollar symbol if present
+                                  .str.replace('%', '')  # Remove percentage symbol
+                                  .str.strip())          # Remove whitespace
+                                  
+                    # Convert to float, replacing invalid values with 0
+                    data[column] = pd.to_numeric(data[column], errors='coerce').fillna(0)
             else:
                 print(f"Warning: Column '{column}' not found. Creating with default value 0")
                 data[column] = 0
