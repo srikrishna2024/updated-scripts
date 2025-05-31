@@ -5,6 +5,9 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import psycopg
 from scipy.optimize import minimize
+import plotly.express as px
+from datetime import datetime
+from scipy.optimize import newton
 
 # -------------------- DATABASE CONFIG --------------------
 
@@ -19,7 +22,165 @@ DB_PARAMS = {
 def get_db_connection():
     return psycopg.connect(**DB_PARAMS)
 
-# -------------------- HELPER FUNCTIONS --------------------
+# -------------------- UTILITY FUNCTIONS --------------------
+
+def format_indian_currency(value):
+    """Format numbers in Indian style (lakhs, crores)"""
+    if pd.isna(value):
+        return "₹0"
+    
+    value = float(value)
+    if value < 100000:
+        return f"₹{value:,.2f}"
+    elif value < 10000000:
+        lakhs = value / 100000
+        return f"₹{lakhs:,.2f} L"
+    else:
+        crores = value / 10000000
+        return f"₹{crores:,.2f} Cr"
+
+# -------------------- PORTFOLIO ANALYSIS FUNCTIONS --------------------
+
+def get_portfolio_data():
+    """Retrieve all records from portfolio_data table"""
+    with get_db_connection() as conn:
+        query = """
+            SELECT date, scheme_name, code, transaction_type, value, units, amount 
+            FROM portfolio_data 
+            ORDER BY date, scheme_name
+        """
+        return pd.read_sql(query, conn)
+
+def get_latest_nav():
+    """Retrieve the latest NAVs from mutual_fund_nav table"""
+    with get_db_connection() as conn:
+        query = """
+            SELECT code, value AS nav_value
+            FROM mutual_fund_nav
+            WHERE (code, nav) IN (
+                SELECT code, MAX(nav) AS nav_date
+                FROM mutual_fund_nav
+                GROUP BY code
+            )
+        """
+        return pd.read_sql(query, conn)
+
+def get_goal_mappings():
+    """Retrieve goal mappings from the goals table including both MF and debt investments"""
+    with get_db_connection() as conn:
+        query = """
+            WITH mf_latest_values AS (
+                SELECT g.goal_name, g.investment_type, g.scheme_name, g.scheme_code,
+                       CASE 
+                           WHEN g.is_manual_entry THEN g.current_value
+                           ELSE COALESCE(p.units * n.value, 0)
+                       END as current_value
+                FROM goals g
+                LEFT JOIN (
+                    SELECT scheme_name, code,
+                           SUM(CASE 
+                               WHEN transaction_type IN ('switch_out', 'redeem') THEN -units
+                               WHEN transaction_type IN ('invest', 'switch_in') THEN units
+                               ELSE 0 
+                           END) as units
+                    FROM portfolio_data
+                    GROUP BY scheme_name, code
+                ) p ON g.scheme_code = p.code
+                LEFT JOIN (
+                    SELECT code, value
+                    FROM mutual_fund_nav
+                    WHERE (code, nav) IN (
+                        SELECT code, MAX(nav)
+                        FROM mutual_fund_nav
+                        GROUP BY code
+                    )
+                ) n ON g.scheme_code = n.code
+            )
+            SELECT goal_name, investment_type, scheme_name, scheme_code, current_value
+            FROM mf_latest_values
+            ORDER BY goal_name, investment_type, scheme_name
+        """
+        return pd.read_sql(query, conn)
+
+def prepare_cashflows(df):
+    """Prepare cashflow data from portfolio transactions"""
+    df['cashflow'] = df.apply(lambda x: 
+        -x['amount'] if x['transaction_type'] in ('invest', 'switch_in')  # Negative because it's money going out
+        else x['amount'] if x['transaction_type'] in ('redeem', 'switch_out')  # Positive because it's money coming in
+        else 0, 
+        axis=1
+    )
+    return df
+
+def calculate_units(df):
+    """Calculate net units for each scheme based on transactions"""
+    df['units_change'] = df.apply(lambda x: 
+        x['units'] if x['transaction_type'] in ('invest', 'switch_in')
+        else -x['units'] if x['transaction_type'] in ('redeem', 'switch_out')
+        else 0,
+        axis=1
+    )
+    
+    # Calculate cumulative units for each scheme
+    df = df.sort_values(['scheme_name', 'date'])
+    df['cumulative_units'] = df.groupby(['scheme_name', 'code'])['units_change'].cumsum()
+    return df
+
+def xirr(transactions):
+    """Calculate XIRR given a set of transactions"""
+    if len(transactions) < 2:
+        return None
+
+    def xnpv(rate):
+        first_date = pd.to_datetime(transactions['date'].min())
+        days = [(pd.to_datetime(date) - first_date).days for date in transactions['date']]
+        return sum([cf * (1 + rate) ** (-d/365.0) for cf, d in zip(transactions['cashflow'], days)])
+
+    def xnpv_der(rate):
+        first_date = pd.to_datetime(transactions['date'].min())
+        days = [(pd.to_datetime(date) - first_date).days for date in transactions['date']]
+        # Ensure rate is valid to avoid invalid power operations
+        if (1 + rate) <= 0:
+            return np.inf  # Return a large value to avoid invalid rates
+        return sum([cf * (-d/365.0) * (1 + rate) ** (-d/365.0 - 1) 
+                   for cf, d in zip(transactions['cashflow'], days)])
+
+    try:
+        return newton(xnpv, x0=0.1, fprime=xnpv_der, maxiter=1000)
+    except:
+        return None
+
+def calculate_portfolio_weights(df, latest_nav, goal_mappings):
+    """Calculate current portfolio weights for each scheme including debt investments"""
+    # First calculate MF values by getting the latest units for each scheme
+    mf_df = df.groupby(['scheme_name', 'code']).agg({
+        'cumulative_units': 'last'
+    }).reset_index()
+
+    mf_df = mf_df.merge(latest_nav, on='code', how='left')
+    mf_df['current_value'] = mf_df['cumulative_units'] * mf_df['nav_value']
+
+    # Get debt investments from goal mappings, excluding any that are already in MF investments
+    debt_investments = goal_mappings[
+        (goal_mappings['investment_type'] == 'Debt') & 
+        (~goal_mappings['scheme_name'].isin(mf_df['scheme_name']))
+    ]
+    
+    # Combine MF and debt investments
+    combined_df = pd.concat([
+        mf_df[['scheme_name', 'current_value']],
+        debt_investments[['scheme_name', 'current_value']]
+    ])
+
+    # Group by scheme_name to handle any remaining duplicates
+    combined_df = combined_df.groupby('scheme_name')['current_value'].sum().reset_index()
+
+    total_value = combined_df['current_value'].sum()
+    combined_df['weight'] = (combined_df['current_value'] / total_value) * 100 if total_value > 0 else 0
+
+    return combined_df
+
+# -------------------- PORTFOLIO OPTIMIZATION FUNCTIONS --------------------
 
 def calculate_rolling_returns(df_nav_pivot, window_days):
     """Calculate rolling returns for given window"""
@@ -480,8 +641,8 @@ with get_db_connection() as conn:
     )
 categories = sorted(categories_df['scheme_category'].dropna().unique().tolist())
 
-# Main interface
-tab1, tab2 = st.tabs(["📈 Analyze Categories", "🔍 Compare Selected Funds"])
+# Main interface with 3 tabs
+tab1, tab2, tab3 = st.tabs(["📈 Analyze Categories", "🔍 Compare Selected Funds", "📊 Analyze Existing Portfolio"])
 
 # -------------------- TAB 1: ANALYZE CATEGORIES --------------------
 with tab1:
@@ -528,8 +689,7 @@ with tab1:
                         # Check if selected categories exist
                         selected_cat_check = pd.read_sql(
                             "SELECT scheme_category, COUNT(*) as fund_count FROM mutual_fund_master_data WHERE scheme_category = ANY(%s) GROUP BY scheme_category",
-                            conn, params=(selected_categories,)
-                        )
+                            conn, params=(selected_categories,))
                         st.write("**Your selected categories:**")
                         st.dataframe(selected_cat_check)
             
@@ -975,6 +1135,248 @@ with tab2:
             else:
                 st.error("No NAV data available for the selected funds.")
 
+# -------------------- TAB 3: ANALYZE EXISTING PORTFOLIO --------------------
+with tab3:
+    st.header("📊 Existing Portfolio Analysis")
+    st.markdown("Analyze your current portfolio allocation and get optimization suggestions based on your risk profile.")
+    
+    # Load portfolio data from the other script
+    with st.spinner("Loading your portfolio data..."):
+        try:
+            # Get all the necessary data
+            df = get_portfolio_data()
+            latest_nav = get_latest_nav()
+            goal_mappings = get_goal_mappings()
+            
+            if df.empty or latest_nav.empty:
+                st.warning("No portfolio data found. Please ensure you have investments recorded.")
+                st.stop()
+                
+            # Prepare the data
+            df['date'] = pd.to_datetime(df['date'])
+            df = prepare_cashflows(df)
+            df = calculate_units(df)
+            
+            # Calculate current portfolio weights
+            weights_df = calculate_portfolio_weights(df, latest_nav, goal_mappings)
+            
+            # Calculate equity and debt allocation
+            equity_value = weights_df[weights_df['scheme_name'].isin(df['scheme_name'].unique())]['current_value'].sum()
+            debt_value = goal_mappings[goal_mappings['investment_type'] == 'Debt']['current_value'].sum()
+            total_portfolio_value = equity_value + debt_value
+            
+            equity_percent = (equity_value / total_portfolio_value) * 100 if total_portfolio_value > 0 else 0
+            debt_percent = (debt_value / total_portfolio_value) * 100 if total_portfolio_value > 0 else 0
+            
+            # Display current allocation
+            st.subheader("Current Asset Allocation")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                fig = px.pie(
+                    values=[equity_value, debt_value],
+                    names=['Equity', 'Debt'],
+                    title="Overall Equity vs Debt Allocation",
+                    height=300
+                )
+                fig.update_traces(textinfo='percent+label', pull=[0.1, 0])
+                st.plotly_chart(fig, use_container_width=True)
+                
+            with col2:
+                st.metric("Total Portfolio Value", format_indian_currency(total_portfolio_value))
+                st.metric("Equity Allocation", f"{equity_percent:.1f}% ({format_indian_currency(equity_value)})")
+                st.metric("Debt Allocation", f"{debt_percent:.1f}% ({format_indian_currency(debt_value)})")
+            
+            # Risk profile selection
+            st.subheader("Portfolio Optimization Settings")
+            risk_tolerance = st.selectbox(
+                "Your Risk Tolerance",
+                options=['conservative', 'moderate', 'aggressive'],
+                index=1,
+                help="Conservative: More debt instruments\nModerate: Balanced approach\nAggressive: Higher equity allocation"
+            )
+            
+            # Suggested allocation based on risk profile
+            st.subheader("Suggested Asset Allocation")
+            
+            if risk_tolerance == 'conservative':
+                suggested_equity = 40
+                suggested_debt = 60
+            elif risk_tolerance == 'moderate':
+                suggested_equity = 60
+                suggested_debt = 40
+            else:  # aggressive
+                suggested_equity = 80
+                suggested_debt = 20
+                
+            col3, col4 = st.columns(2)
+            
+            with col3:
+                fig = px.pie(
+                    values=[suggested_equity, suggested_debt],
+                    names=['Equity', 'Debt'],
+                    title=f"Suggested {risk_tolerance.title()} Allocation",
+                    height=300
+                )
+                fig.update_traces(textinfo='percent+label', pull=[0.1, 0])
+                st.plotly_chart(fig, use_container_width=True)
+                
+            with col4:
+                current_diff = equity_percent - suggested_equity
+                action = "Reduce" if current_diff > 0 else "Increase"
+                st.metric("Suggested Equity Allocation", f"{suggested_equity}%", 
+                         delta=f"{action} by {abs(current_diff):.1f}%")
+                st.metric("Suggested Debt Allocation", f"{suggested_debt}%", 
+                         delta=f"{'Increase' if current_diff > 0 else 'Reduce'} by {abs(current_diff):.1f}%")
+            
+            # Analyze current mutual fund holdings
+            st.subheader("Current Mutual Fund Holdings Analysis")
+            
+            # Get NAV data for current holdings
+            current_fund_codes = df['code'].unique()
+            with get_db_connection() as conn:
+                nav_query = """
+                    SELECT nav, code, value
+                    FROM mutual_fund_nav
+                    WHERE code = ANY(%s)
+                    ORDER BY nav ASC
+                """
+                df_nav = pd.read_sql(nav_query, conn, params=(list(current_fund_codes),))
+            
+            if not df_nav.empty:
+                df_nav_pivot = df_nav.pivot(index='nav', columns='code', values='value')
+                
+                # Calculate rolling returns
+                window = int(252 * rolling_period_years)
+                rolling_returns = calculate_rolling_returns(df_nav_pivot, window)
+                
+                if not rolling_returns.empty:
+                    # Get fund details
+                    with get_db_connection() as conn:
+                        fund_query = """
+                            SELECT code, scheme_name, scheme_category
+                            FROM mutual_fund_master_data
+                            WHERE code = ANY(%s)
+                        """
+                        fund_details = pd.read_sql(fund_query, conn, params=(list(current_fund_codes),))
+                    
+                    # Check if we got any results
+                    if fund_details.empty:
+                        st.warning("No fund details found in the database for your portfolio holdings")
+                        st.stop()
+                    
+                    # Calculate metrics for each fund
+                    metrics_data = []
+                    for code in rolling_returns.columns:
+                        # Check if we have details for this fund
+                        fund_info = fund_details[fund_details['code'] == code]
+                        if fund_info.empty:
+                            st.warning(f"No details found for fund code: {code}")
+                            continue
+                            
+                        fund_returns = rolling_returns[code].dropna()
+                        consistency_score = calculate_consistency_score(fund_returns)
+                        positive_ratio = (fund_returns > 0).sum() / len(fund_returns) if len(fund_returns) > 0 else 0
+                        
+                        # Get current weight - handle case where fund might not be in weights_df
+                        current_weight = 0
+                        scheme_name = fund_info['scheme_name'].values[0]
+                        weight_match = weights_df[weights_df['scheme_name'] == scheme_name]
+                        if not weight_match.empty:
+                            current_weight = weight_match['weight'].values[0]
+                        
+                        metrics_data.append({
+                            'Fund Code': code,
+                            'Fund Name': fund_info['scheme_name'].values[0],
+                            'Category': fund_info['scheme_category'].values[0],
+                            'Current Weight (%)': current_weight,
+                            'Latest Return': fund_returns.iloc[-1] if len(fund_returns) > 0 else 0,
+                            'Average Return': fund_returns.mean(),
+                            'Volatility': fund_returns.std(),
+                            'Consistency Score': consistency_score,
+                            'Positive Return %': positive_ratio,
+                            'Sharpe Ratio': (fund_returns.mean() - 0.06) / fund_returns.std() if fund_returns.std() > 0 else 0
+                        })
+                    
+                    if not metrics_data:
+                        st.error("No valid fund metrics could be calculated. Please check your portfolio data.")
+                        st.stop()
+
+                    metrics_df = pd.DataFrame(metrics_data)
+
+                    # Only proceed if we have data to display
+                    if metrics_df.empty:
+                        st.warning("No performance metrics available for your current holdings")
+                        st.stop()
+                    
+                    # Display metrics
+                    st.dataframe(
+                        metrics_df.sort_values('Consistency Score', ascending=False),
+                        use_container_width=True
+                    )
+                    
+                    # Optimization suggestions
+                    st.subheader("Fund Optimization Suggestions")
+                    
+                    # Identify funds to consider reducing
+                    low_performers = metrics_df[
+                        (metrics_df['Consistency Score'] < 0) | 
+                        (metrics_df['Sharpe Ratio'] < 0.5)
+                    ].sort_values('Consistency Score')
+                    
+                    if not low_performers.empty:
+                        st.warning("⚠️ Consider reducing exposure to these lower-performing funds:")
+                        st.dataframe(low_performers, use_container_width=True)
+                    
+                    # Find similar categories in current portfolio
+                    current_categories = metrics_df['Category'].unique()
+                    similar_categories = []
+                    for cat in current_categories:
+                        if any(c.lower() in cat.lower() for c in ['equity', 'growth', 'flexi', 'multi']):
+                            similar_categories.append('Equity')
+                        elif any(c.lower() in cat.lower() for c in ['debt', 'income', 'gilt']):
+                            similar_categories.append('Debt')
+                        else:
+                            similar_categories.append('Other')
+                    
+                    # Correlation analysis
+                    corr_matrix = rolling_returns.corr()
+                    avg_corr = corr_matrix.where(~np.eye(corr_matrix.shape[0], dtype=bool)).mean().mean()
+                    
+                    st.metric("Average Correlation Among Holdings", f"{avg_corr:.3f}")
+                    
+                    if avg_corr > 0.7:
+                        st.warning("⚠️ High correlation among your funds - consider adding more diversified options")
+                    elif avg_corr < 0.3:
+                        st.success("✅ Good diversification - your funds have low correlation")
+                    else:
+                        st.info("ℹ️ Moderate correlation - could benefit from some additional diversification")
+                    
+                    # Suggested actions
+                    st.subheader("Recommended Actions")
+                    
+                    if current_diff > 5:  # More equity than suggested
+                        st.info(f"🔧 **Rebalance Portfolio**: Move {abs(current_diff):.1f}% from equity to debt to align with {risk_tolerance} risk profile")
+                    elif current_diff < -5:  # Less equity than suggested
+                        st.info(f"🔧 **Rebalance Portfolio**: Move {abs(current_diff):.1f}% from debt to equity to align with {risk_tolerance} risk profile")
+                    else:
+                        st.success("✅ Your current allocation aligns well with your selected risk profile")
+                    
+                    if not low_performers.empty:
+                        st.info("🔧 **Consider replacing** lower-consistency funds with more consistent performers from similar categories")
+                    
+                    if avg_corr > 0.7:
+                        st.info("🔧 **Add uncorrelated assets** to improve portfolio diversification")
+                    
+                else:
+                    st.warning("Could not calculate rolling returns for current holdings")
+            else:
+                st.warning("No NAV data found for current holdings")
+                
+        except Exception as e:
+            st.error(f"Error loading portfolio data: {e}")
+            st.error("Please ensure the portfolio analysis database tables exist and contain data")
+
 # -------------------- FOOTER --------------------
 st.markdown("---")
 st.markdown("### 📚 How to Use This Tool")
@@ -993,6 +1395,13 @@ with st.expander("Click for detailed instructions"):
     4. Review **optimized portfolio allocation** recommendations
     5. Compare different allocation strategies
     6. Use insights for investment decisions prioritizing stability
+    
+    **Existing Portfolio Analysis Tab:**
+    1. Automatically loads your current portfolio from the database
+    2. Shows your current equity vs debt allocation
+    3. Provides suggested allocation based on your risk tolerance
+    4. Analyzes each fund's consistency and performance
+    5. Recommends specific actions to optimize your portfolio
     
     **Portfolio Optimization Features:**
     - **Optimized Allocation**: Uses mathematical optimization to balance returns, consistency, and diversification
@@ -1021,4 +1430,5 @@ st.info("""
 - ✅ Considers your **risk tolerance** in optimization
 - ✅ **Visual allocation recommendations** with pie charts and performance metrics
 - ✅ Focuses on long-term reliability over short-term gains
+- ✅ **Analyzes your existing portfolio** and suggests improvements
 """)
