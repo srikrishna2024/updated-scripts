@@ -6,8 +6,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import psycopg
 from scipy.optimize import minimize
-from datetime import datetime
+from datetime import datetime, timedelta
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # -------------------- DATABASE CONFIG --------------------
 DB_PARAMS = {
@@ -167,11 +169,12 @@ def calculate_retirement_corpus(
 ):
     """
     Calculate retirement corpus needed and annual investment requirements.
+    Returns corpus_needed, annual_investments, corpus_projection, monthly_investments
     """
     # Validate inputs
     if retirement_age <= current_age:
         st.error("Retirement age must be greater than current age")
-        return None, None, None
+        return None, None, None, None
     
     years_to_retirement = retirement_age - current_age
     retirement_years = life_expectancy - retirement_age
@@ -197,6 +200,7 @@ def calculate_retirement_corpus(
     
     # Calculate annual investments needed with glide path
     projection_data = []
+    monthly_investment_data = []
     current_equity_value = current_equity
     current_debt_value = current_debt
     
@@ -260,8 +264,19 @@ def calculate_retirement_corpus(
             'Debt Investment': debt_investment,
             'Projected Expenses': current_annual_expenses * ((1 + annual_expenses_growth) ** year)
         })
+        
+        # Calculate monthly investments for this year
+        for month in range(1, 13):
+            monthly_investment_data.append({
+                'Year': age,
+                'Month': month,
+                'Equity Investment': equity_investment / 12,
+                'Debt Investment': debt_investment / 12,
+                'Total Investment': (equity_investment + debt_investment) / 12
+            })
     
     corpus_projection = pd.DataFrame(projection_data)
+    monthly_investments = pd.DataFrame(monthly_investment_data)
     
     # Calculate average annual investments
     if not corpus_projection.empty:
@@ -275,7 +290,7 @@ def calculate_retirement_corpus(
         'debt': avg_annual_investment * 0.2     # Start with 20% debt allocation
     }
     
-    return corpus_needed, annual_investments, corpus_projection
+    return corpus_needed, annual_investments, corpus_projection, monthly_investments
 
 # -------------------- RETIREMENT TRACKING FUNCTIONS --------------------
 def save_retirement_plan(plan_data, plan_type="BASELINE"):
@@ -414,6 +429,240 @@ def plot_progress_comparison(progress_data):
     
     return fig
 
+# -------------------- CASHFLOW PLANNER FUNCTIONS --------------------
+def plot_cashflow_plan(monthly_investments, actual_equity, actual_debt, equity_return, debt_return, corpus_needed):
+    """Plot the cashflow plan comparing suggested vs actual investments"""
+    # Calculate cumulative investments for suggested plan
+    monthly_investments['Cumulative Equity Suggested'] = monthly_investments['Equity Investment'].cumsum()
+    monthly_investments['Cumulative Debt Suggested'] = monthly_investments['Debt Investment'].cumsum()
+    
+    # Calculate actual investments
+    monthly_investments['Equity Investment Actual'] = actual_equity
+    monthly_investments['Debt Investment Actual'] = actual_debt
+    monthly_investments['Cumulative Equity Actual'] = monthly_investments['Equity Investment Actual'].cumsum()
+    monthly_investments['Cumulative Debt Actual'] = monthly_investments['Debt Investment Actual'].cumsum()
+    
+    # Create a date column for plotting - fixed timestamp issue
+    start_date = pd.Timestamp(datetime.now().date()).replace(day=1)
+    monthly_investments['Date'] = pd.date_range(
+        start=start_date,
+        periods=len(monthly_investments),
+        freq='MS'  # Month Start frequency
+    )
+    
+    # Rest of the function remains the same...
+    # Create figure with secondary y-axis
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    # Add suggested investments
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_investments['Date'],
+            y=monthly_investments['Equity Investment'],
+            name='Suggested Equity',
+            line=dict(color='blue', width=2),
+            stackgroup='suggested',
+            hovertemplate='%{y:,.0f}'
+        ),
+        secondary_y=False
+    )
+    
+    # ... rest of the plotting code ...
+    
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_investments['Date'],
+            y=monthly_investments['Debt Investment'],
+            name='Suggested Debt',
+            line=dict(color='orange', width=2),
+            stackgroup='suggested',
+            hovertemplate='%{y:,.0f}'
+        ),
+        secondary_y=False
+    )
+    
+    # Add actual investments
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_investments['Date'],
+            y=monthly_investments['Equity Investment Actual'],
+            name='Actual Equity',
+            line=dict(color='blue', width=2, dash='dot'),
+            stackgroup='actual',
+            hovertemplate='%{y:,.0f}'
+        ),
+        secondary_y=False
+    )
+    
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_investments['Date'],
+            y=monthly_investments['Debt Investment Actual'],
+            name='Actual Debt',
+            line=dict(color='orange', width=2, dash='dot'),
+            stackgroup='actual',
+            hovertemplate='%{y:,.0f}'
+        ),
+        secondary_y=False
+    )
+    
+    # Add cumulative totals on secondary axis
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_investments['Date'],
+            y=monthly_investments['Cumulative Equity Suggested'] + monthly_investments['Cumulative Debt Suggested'],
+            name='Suggested Total Corpus',
+            line=dict(color='green', width=3),
+            hovertemplate='%{y:,.0f}'
+        ),
+        secondary_y=True
+    )
+    
+    # Calculate actual corpus growth with returns
+    monthly_investments['Actual Equity Value'] = 0.0
+    monthly_investments['Actual Debt Value'] = 0.0
+    
+    for i in range(len(monthly_investments)):
+        if i == 0:
+            monthly_investments.loc[i, 'Actual Equity Value'] = monthly_investments.loc[i, 'Equity Investment Actual']
+            monthly_investments.loc[i, 'Actual Debt Value'] = monthly_investments.loc[i, 'Debt Investment Actual']
+        else:
+            # Apply monthly returns to previous value and add new investment
+            monthly_equity_return = (1 + equity_return) ** (1/12) - 1
+            monthly_debt_return = (1 + debt_return) ** (1/12) - 1
+            
+            monthly_investments.loc[i, 'Actual Equity Value'] = (
+                monthly_investments.loc[i-1, 'Actual Equity Value'] * (1 + monthly_equity_return) + 
+                monthly_investments.loc[i, 'Equity Investment Actual']
+            )
+            monthly_investments.loc[i, 'Actual Debt Value'] = (
+                monthly_investments.loc[i-1, 'Actual Debt Value'] * (1 + monthly_debt_return) + 
+                monthly_investments.loc[i, 'Debt Investment Actual']
+            )
+    
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_investments['Date'],
+            y=monthly_investments['Actual Equity Value'] + monthly_investments['Actual Debt Value'],
+            name='Projected Actual Corpus',
+            line=dict(color='red', width=3),
+            hovertemplate='%{y:,.0f}'
+        ),
+        secondary_y=True
+    )
+    
+    # Add corpus needed line
+    fig.add_hline(
+        y=corpus_needed,
+        line_dash="dash",
+        line_color="purple",
+        annotation_text=f"Corpus Needed: {format_indian_currency(corpus_needed)}",
+        annotation_position="bottom right",
+        secondary_y=True
+    )
+    
+    # Find when actual corpus meets required corpus
+    actual_corpus = monthly_investments['Actual Equity Value'] + monthly_investments['Actual Debt Value']
+    meets_corpus = monthly_investments[actual_corpus >= corpus_needed]
+    
+    if not meets_corpus.empty:
+        first_meet = meets_corpus.iloc[0]
+        fig.add_vline(
+            x=first_meet['Date'],
+            line_dash="dot",
+            line_color="red",
+            annotation_text=f"Target met in {first_meet['Year']}",
+            annotation_position="top right"
+        )
+    
+    # Update layout
+    fig.update_layout(
+        title='Monthly Investment Plan: Suggested vs Actual',
+        xaxis_title='Date',
+        yaxis_title='Monthly Investment (₹)',
+        yaxis2_title='Cumulative Corpus (₹)',
+        hovermode='x unified',
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+    )
+    
+    fig.update_yaxes(
+        title_text="Monthly Investment (₹)",
+        secondary_y=False,
+        tickprefix="₹"
+    )
+    
+    fig.update_yaxes(
+        title_text="Cumulative Corpus (₹)",
+        secondary_y=True,
+        tickprefix="₹"
+    )
+    
+    return fig, monthly_investments
+
+def calculate_early_retirement(monthly_investments, corpus_needed, equity_return, debt_return):
+    """Calculate when the actual investments will meet the corpus needed"""
+    # Calculate monthly returns
+    monthly_equity_return = (1 + equity_return) ** (1/12) - 1
+    monthly_debt_return = (1 + debt_return) ** (1/12) - 1
+    
+    # Initialize tracking variables
+    equity_value = 0
+    debt_value = 0
+    months_to_retirement = 0
+    
+    for _, row in monthly_investments.iterrows():
+        # Apply returns to existing corpus
+        equity_value *= (1 + monthly_equity_return)
+        debt_value *= (1 + monthly_debt_return)
+        
+        # Add new investments
+        equity_value += row['Equity Investment Actual']
+        debt_value += row['Debt Investment Actual']
+        
+        months_to_retirement += 1
+        
+        # Check if we've reached the target
+        if (equity_value + debt_value) >= corpus_needed:
+            break
+    
+    # If we didn't reach the target in the original timeframe
+    if (equity_value + debt_value) < corpus_needed:
+        # Continue projecting beyond original retirement date
+        last_row = monthly_investments.iloc[-1]
+        actual_equity = last_row['Equity Investment Actual']
+        actual_debt = last_row['Debt Investment Actual']
+        
+        while (equity_value + debt_value) < corpus_needed:
+            # Apply returns to existing corpus
+            equity_value *= (1 + monthly_equity_return)
+            debt_value *= (1 + monthly_debt_return)
+            
+            # Add new investments (using last known actual values)
+            equity_value += actual_equity
+            debt_value += actual_debt
+            
+            months_to_retirement += 1
+    
+    years = months_to_retirement // 12
+    months = months_to_retirement % 12
+    
+    return years, months, equity_value + debt_value
+
+def get_yearly_investment_summary(monthly_investments):
+    """Aggregate monthly investments to yearly summary"""
+    yearly_summary = monthly_investments.groupby('Year').agg({
+        'Equity Investment': 'sum',
+        'Debt Investment': 'sum',
+        'Total Investment': 'sum'
+    }).reset_index()
+    
+    # Format currency values
+    yearly_summary['Equity Investment'] = yearly_summary['Equity Investment'].apply(format_indian_currency)
+    yearly_summary['Debt Investment'] = yearly_summary['Debt Investment'].apply(format_indian_currency)
+    yearly_summary['Total Investment'] = yearly_summary['Total Investment'].apply(format_indian_currency)
+    
+    return yearly_summary
+
 # -------------------- STREAMLIT UI --------------------
 def retirement_planner_tab():
     st.header("🏦 Retirement Planner with Progress Tracking")
@@ -471,7 +720,7 @@ def retirement_planner_tab():
         st.warning("No baseline retirement plan found. Create your baseline plan first.")
         if st.button("Create Baseline Retirement Plan", type="primary"):
             with st.spinner("Creating your baseline retirement plan..."):
-                corpus_needed, annual_investments, projection_df = calculate_retirement_corpus(
+                corpus_needed, annual_investments, projection_df, monthly_investments = calculate_retirement_corpus(
                     current_age=current_age,
                     retirement_age=retirement_age,
                     current_monthly_expenses=current_monthly_expenses,
@@ -533,7 +782,7 @@ def retirement_planner_tab():
         
         # Show glide path
         st.subheader("📉 Asset Allocation Glide Path")
-        _, annual_investments, projection_df = calculate_retirement_corpus(
+        _, annual_investments, projection_df, monthly_investments = calculate_retirement_corpus(
             current_age=baseline_plan['current_age'],
             retirement_age=baseline_plan['retirement_age'],
             current_monthly_expenses=baseline_plan['current_monthly_expenses'],
@@ -728,6 +977,254 @@ def portfolio_optimizer_tab():
                 except Exception as e:
                     st.error(f"Error loading portfolio: {str(e)}")
 
+def cashflow_planner_tab():
+    st.header("💰 Retirement Cashflow Planner")
+    
+    # Check for existing baseline plan
+    existing_plans = get_retirement_plans()
+    has_baseline = not existing_plans.empty and 'BASELINE' in existing_plans['plan_type'].values
+    
+    if not has_baseline:
+        st.warning("Please create a baseline retirement plan first in the Retirement Planner tab.")
+        return
+    
+    baseline_plan = existing_plans[existing_plans['plan_type'] == 'BASELINE'].iloc[0]
+    
+    # Get current investments
+    current_equity, current_debt = get_retirement_investments()
+    
+    # Calculate the monthly investment plan
+    corpus_needed, annual_investments, projection_df, monthly_investments = calculate_retirement_corpus(
+        current_age=baseline_plan['current_age'],
+        retirement_age=baseline_plan['retirement_age'],
+        current_monthly_expenses=baseline_plan['current_monthly_expenses'],
+        annual_expenses_growth=baseline_plan['annual_expenses_growth'],
+        recurring_annual_expenses=baseline_plan['recurring_annual_expenses'],
+        post_retirement_inflation=baseline_plan['post_retirement_inflation'],
+        equity_return=baseline_plan['equity_return'],
+        debt_return=baseline_plan['debt_return'],
+        current_equity=current_equity,
+        current_debt=current_debt,
+        life_expectancy=baseline_plan['life_expectancy']
+    )
+    
+    # User inputs for actual investments
+    st.subheader("Your Actual Monthly Investments")
+    col1, col2 = st.columns(2)
+    with col1:
+        actual_equity = st.number_input("Actual Equity Investment (₹ per month)", 
+                                     min_value=0, 
+                                     value=int(monthly_investments['Equity Investment'].mean()),
+                                     step=1000)
+    with col2:
+        actual_debt = st.number_input("Actual Debt Investment (₹ per month)", 
+                                   min_value=0, 
+                                   value=int(monthly_investments['Debt Investment'].mean()),
+                                   step=1000)
+    
+    # Add actual investment columns to the DataFrame
+    monthly_investments['Equity Investment Actual'] = actual_equity
+    monthly_investments['Debt Investment Actual'] = actual_debt
+    
+    # Calculate cumulative actual investments
+    monthly_investments['Cumulative Equity Actual'] = monthly_investments['Equity Investment Actual'].cumsum()
+    monthly_investments['Cumulative Debt Actual'] = monthly_investments['Debt Investment Actual'].cumsum()
+    
+    # Create date sequence properly
+    start_date = pd.Timestamp(datetime.now().date()).replace(day=1)
+    monthly_investments['Date'] = pd.date_range(
+        start=start_date,
+        periods=len(monthly_investments),
+        freq='MS'  # Month Start frequency
+    )
+    
+    # Calculate actual corpus growth with returns
+    monthly_equity_return = (1 + baseline_plan['equity_return']) ** (1/12) - 1
+    monthly_debt_return = (1 + baseline_plan['debt_return']) ** (1/12) - 1
+    
+    monthly_investments['Actual Equity Value'] = 0.0
+    monthly_investments['Actual Debt Value'] = 0.0
+    
+    for i in range(len(monthly_investments)):
+        if i == 0:
+            monthly_investments.loc[i, 'Actual Equity Value'] = monthly_investments.loc[i, 'Equity Investment Actual']
+            monthly_investments.loc[i, 'Actual Debt Value'] = monthly_investments.loc[i, 'Debt Investment Actual']
+        else:
+            monthly_investments.loc[i, 'Actual Equity Value'] = (
+                monthly_investments.loc[i-1, 'Actual Equity Value'] * (1 + monthly_equity_return) + 
+                monthly_investments.loc[i, 'Equity Investment Actual']
+            )
+            monthly_investments.loc[i, 'Actual Debt Value'] = (
+                monthly_investments.loc[i-1, 'Actual Debt Value'] * (1 + monthly_debt_return) + 
+                monthly_investments.loc[i, 'Debt Investment Actual']
+            )
+    
+    # Show yearly investment summary table
+    st.subheader("📅 Yearly Investment Plan (Suggested)")
+    yearly_summary = monthly_investments.groupby('Year').agg({
+        'Equity Investment': 'sum',
+        'Debt Investment': 'sum',
+        'Total Investment': 'sum'
+    }).reset_index()
+    
+    # Format for display
+    display_summary = yearly_summary.copy()
+    display_summary['Equity Investment'] = display_summary['Equity Investment'].apply(format_indian_currency)
+    display_summary['Debt Investment'] = display_summary['Debt Investment'].apply(format_indian_currency)
+    display_summary['Total Investment'] = display_summary['Total Investment'].apply(format_indian_currency)
+    display_summary['Year'] = display_summary['Year'].astype(int)
+    
+    st.dataframe(display_summary, hide_index=True, use_container_width=True)
+    
+    # Plot the cashflow plan with log scale
+    st.subheader("📈 Investment Plan: Suggested vs Actual (Log Scale)")
+    
+    # Create the plot with log scale
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    # Add suggested investments (using the actual values from monthly_investments)
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_investments['Date'],
+            y=monthly_investments['Equity Investment'],
+            name='Suggested Equity',
+            line=dict(color='blue', width=2),
+            hovertemplate='₹%{y:,.0f}<extra></extra>'
+        ),
+        secondary_y=False
+    )
+    
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_investments['Date'],
+            y=monthly_investments['Debt Investment'],
+            name='Suggested Debt',
+            line=dict(color='orange', width=2),
+            hovertemplate='₹%{y:,.0f}<extra></extra>'
+        ),
+        secondary_y=False
+    )
+    
+    # Add actual investments
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_investments['Date'],
+            y=monthly_investments['Equity Investment Actual'],
+            name='Actual Equity',
+            line=dict(color='blue', width=2, dash='dot'),
+            hovertemplate='₹%{y:,.0f}<extra></extra>'
+        ),
+        secondary_y=False
+    )
+    
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_investments['Date'],
+            y=monthly_investments['Debt Investment Actual'],
+            name='Actual Debt',
+            line=dict(color='orange', width=2, dash='dot'),
+            hovertemplate='₹%{y:,.0f}<extra></extra>'
+        ),
+        secondary_y=False
+    )
+    
+    # Add corpus projections on secondary axis
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_investments['Date'],
+            y=monthly_investments['Actual Equity Value'] + monthly_investments['Actual Debt Value'],
+            name='Projected Corpus',
+            line=dict(color='green', width=3),
+            hovertemplate='₹%{y:,.0f}<extra></extra>'
+        ),
+        secondary_y=True
+    )
+    
+    # Add corpus needed line
+    fig.add_hline(
+        y=baseline_plan['corpus_needed'],
+        line_dash="dash",
+        line_color="purple",
+        annotation_text=f"Corpus Needed: {format_indian_currency(baseline_plan['corpus_needed'])}",
+        annotation_position="bottom right",
+        secondary_y=True
+    )
+    
+    # Update layout with log scale
+    fig.update_layout(
+        title='Monthly Investment Plan: Suggested vs Actual (Log Scale)',
+        xaxis_title='Date',
+        yaxis_title='Monthly Investment (₹) - Log Scale',
+        yaxis2_title='Cumulative Corpus (₹) - Log Scale',
+        hovermode='x unified',
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        yaxis_type="log",
+        yaxis2_type="log"
+    )
+    
+    fig.update_yaxes(
+        title_text="Monthly Investment (₹)",
+        secondary_y=False,
+        tickprefix="₹",
+        type="log"
+    )
+    
+    fig.update_yaxes(
+        title_text="Cumulative Corpus (₹)",
+        secondary_y=True,
+        tickprefix="₹",
+        type="log"
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Rest of the function remains the same...
+    # Calculate retirement timeline
+    st.subheader("⏳ Retirement Timeline Projection")
+    actual_corpus = monthly_investments['Actual Equity Value'] + monthly_investments['Actual Debt Value']
+    meets_corpus = monthly_investments[actual_corpus >= baseline_plan['corpus_needed']]
+    
+    original_years = baseline_plan['retirement_age'] - baseline_plan['current_age']
+    
+    if not meets_corpus.empty:
+        first_meet = meets_corpus.iloc[0]
+        years_to_meet = first_meet['Year'] - baseline_plan['current_age']
+        months_to_meet = first_meet['Month']
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Original Retirement Age", baseline_plan['retirement_age'])
+            st.metric("Original Timeline", f"{original_years} years")
+        
+        with col2:
+            if years_to_meet < original_years:
+                st.metric("Projected Retirement Age", first_meet['Year'], 
+                         delta=f"{original_years - years_to_meet} years early")
+            else:
+                st.metric("Projected Retirement Age", first_meet['Year'], 
+                         delta=f"{years_to_meet - original_years} years late")
+            
+            st.metric("Projected Corpus", format_indian_currency(first_meet['Actual Equity Value'] + first_meet['Actual Debt Value']))
+    else:
+        st.warning("With current investment amounts, you won't reach your retirement corpus by the planned age.")
+        
+        # Calculate how much longer it would take
+        last_row = monthly_investments.iloc[-1]
+        remaining_corpus = baseline_plan['corpus_needed'] - (last_row['Actual Equity Value'] + last_row['Actual Debt Value'])
+        additional_years = np.ceil(remaining_corpus / (12 * (actual_equity + actual_debt)))
+        
+        st.error(f"You would need to work approximately {int(additional_years)} more years at current investment levels.")
+    
+    # Show detailed monthly investments
+    with st.expander("📝 View Detailed Monthly Investment Plan", expanded=False):
+        display_df = monthly_investments.copy()
+        display_df['Year'] = display_df['Year'].astype(int)
+        display_df['Month'] = display_df['Month'].astype(int)
+        display_df = display_df[['Year', 'Month', 'Equity Investment', 'Debt Investment', 'Total Investment']]
+        display_df['Equity Investment'] = display_df['Equity Investment'].apply(format_indian_currency)
+        display_df['Debt Investment'] = display_df['Debt Investment'].apply(format_indian_currency)
+        display_df['Total Investment'] = display_df['Total Investment'].apply(format_indian_currency)
+        st.dataframe(display_df, hide_index=True, use_container_width=True)
 # -------------------- MAIN APP --------------------
 def main():
     st.set_page_config(
@@ -763,12 +1260,15 @@ def main():
     """, unsafe_allow_html=True)
     
     # Create tabs
-    tab1, tab2 = st.tabs(["🏦 Retirement Planner", "📊 Portfolio Optimizer"])
+    tab1, tab2, tab3 = st.tabs(["🏦 Retirement Planner", "💰 Cashflow Planner", "📊 Portfolio Optimizer"])
     
     with tab1:
         retirement_planner_tab()
     
     with tab2:
+        cashflow_planner_tab()
+    
+    with tab3:
         portfolio_optimizer_tab()
 
 if __name__ == "__main__":
