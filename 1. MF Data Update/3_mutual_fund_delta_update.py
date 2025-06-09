@@ -6,7 +6,13 @@ import os
 LOG_FILE = "nav_update_log.txt"
 
 def clear_log():
-    """Clears the log file."""
+    """
+    Clears the log file.
+
+    This function is called at the start of the program to ensure that the log file
+    contains only the logs related to the current execution. It helps in maintaining
+    a clean log file and avoids confusion caused by logs from previous runs.
+    """
     with open(LOG_FILE, "w") as file:
         file.write("")
 
@@ -44,6 +50,15 @@ def fetch_schemes_to_update(cursor, specific_code=None):
             valid_schemes.append(scheme)
     return valid_schemes
 
+def fetch_portfolio_schemes(cursor):
+    """Fetches all unique scheme codes from the portfolio_data table."""
+    cursor.execute("""
+        SELECT DISTINCT code, scheme_name
+        FROM portfolio_data
+        WHERE code IS NOT NULL;
+    """)
+    return cursor.fetchall()
+
 def fetch_nav_data(scheme_code, retries=3):
     """Fetches NAV data for a specific scheme using MFAPI with retry logic."""
     api_url = f"https://api.mfapi.in/mf/{scheme_code}"
@@ -71,7 +86,7 @@ def update_nav_data(cursor, schemes):
             updated_records = 0
             for nav_entry in nav_data['data']:
                 nav_date = datetime.strptime(nav_entry['date'], "%d-%m-%Y").date()
-                if nav_date <= most_recent_nav_date:
+                if most_recent_nav_date and nav_date <= most_recent_nav_date:
                     continue  # Skip older NAV data
                 nav_value = float(nav_entry['nav'])
                 cursor.execute("""
@@ -99,15 +114,13 @@ def nav_recent_updater(db_config):
         - 'password': Password for the database
         - 'host': Host address of the database
         - 'port': Port number of the database
-    The function provides two options to the user:
+    The function provides three options to the user:
     1. Update all schemes
     2. Update a specific scheme by entering its scheme code
+    3. Update all schemes present in the portfolio
     The function fetches the schemes to update based on the user's choice and updates their NAV data.
     It commits the changes to the database and logs the process.
     If an error occurs during the process, it prints the error message and logs it.
-    Note:
-    - The function assumes the existence of helper functions `fetch_schemes_to_update`, `update_nav_data`, and `write_log`.
-    - The function uses the `psycopg` library to connect to the PostgreSQL database.
     """
     try:
         # Clear the log file at the beginning
@@ -123,8 +136,8 @@ def nav_recent_updater(db_config):
         ) as connection:
             with connection.cursor() as cursor:
                 # Get user's choice
-                print("Choose an option:\n1. Update all schemes\n2. Update a specific scheme")
-                choice = input("Enter your choice (1/2): ")
+                print("Choose an option:\n1. Update all schemes\n2. Update a specific scheme\n3. Update all schemes in portfolio")
+                choice = input("Enter your choice (1/2/3): ")
 
                 if choice == "1":
                     schemes_to_update = fetch_schemes_to_update(cursor)
@@ -137,6 +150,36 @@ def nav_recent_updater(db_config):
                     else:
                         print(f"No eligible schemes found for code {scheme_code}.")
                         write_log(f"No eligible schemes found for code {scheme_code}.")
+                elif choice == "3":
+                    # Get all schemes from portfolio_data table
+                    portfolio_schemes = fetch_portfolio_schemes(cursor)
+                    if not portfolio_schemes:
+                        print("No schemes found in portfolio_data table.")
+                        write_log("No schemes found in portfolio_data table.")
+                        return
+                    
+                    # Convert portfolio schemes to format compatible with update_nav_data
+                    schemes_to_update = []
+                    for code, scheme_name in portfolio_schemes:
+                        # For each portfolio scheme, get its most recent NAV date
+                        cursor.execute("""
+                            SELECT code, scheme_name, MAX(nav) AS most_recent_nav_date
+                            FROM mutual_fund_nav
+                            WHERE code = %s
+                            GROUP BY code, scheme_name;
+                        """, (code,))
+                        result = cursor.fetchone()
+                        if result:
+                            schemes_to_update.append(result)
+                        else:
+                            # If scheme exists in portfolio but not in NAV table, add it with None as nav date
+                            schemes_to_update.append((code, scheme_name, None))
+                    
+                    if schemes_to_update:
+                        update_nav_data(cursor, schemes_to_update)
+                    else:
+                        print("No eligible schemes found in portfolio.")
+                        write_log("No eligible schemes found in portfolio.")
                 else:
                     print("Invalid choice. Exiting.")
                     write_log("Invalid choice made by user.")
