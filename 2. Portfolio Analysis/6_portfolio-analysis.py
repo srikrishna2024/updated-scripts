@@ -1,10 +1,10 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 from datetime import datetime
 import psycopg
-from scipy.optimize import newton
 import plotly.express as px
+import plotly.graph_objects as go
+from pyxirr import xirr  # You'll need to install the xirr package: pip install xirr
 
 def format_indian_number(number):
     """
@@ -81,6 +81,16 @@ def get_latest_nav():
         """
         return pd.read_sql(query, conn)
 
+def get_benchmark_data():
+    """Retrieve benchmark data"""
+    with connect_to_db() as conn:
+        query = """
+            SELECT date, price
+            FROM benchmark
+            ORDER BY date
+        """
+        return pd.read_sql(query, conn)
+
 def get_goal_mappings():
     """Retrieve goal mappings from the goals table including both MF and debt investments"""
     with connect_to_db() as conn:
@@ -142,30 +152,6 @@ def calculate_units(df):
     df['cumulative_units'] = df.groupby(['scheme_name', 'code'])['units_change'].cumsum()
     return df
 
-def xirr(transactions):
-    """Calculate XIRR given a set of transactions"""
-    if len(transactions) < 2:
-        return None
-
-    def xnpv(rate):
-        first_date = pd.to_datetime(transactions['date'].min())
-        days = [(pd.to_datetime(date) - first_date).days for date in transactions['date']]
-        return sum([cf * (1 + rate) ** (-d/365.0) for cf, d in zip(transactions['cashflow'], days)])
-
-    def xnpv_der(rate):
-        first_date = pd.to_datetime(transactions['date'].min())
-        days = [(pd.to_datetime(date) - first_date).days for date in transactions['date']]
-        # Ensure rate is valid to avoid invalid power operations
-        if (1 + rate) <= 0:
-            return np.inf  # Return a large value to avoid invalid rates
-        return sum([cf * (-d/365.0) * (1 + rate) ** (-d/365.0 - 1) 
-                    for cf, d in zip(transactions['cashflow'], days)])
-
-    try:
-        return newton(xnpv, x0=0.1, fprime=xnpv_der, maxiter=1000)
-    except:
-        return None
-
 def calculate_portfolio_weights(df, latest_nav, goal_mappings):
     """Calculate current portfolio weights for each scheme including debt investments"""
     # First calculate MF values by getting the latest units for each scheme
@@ -196,168 +182,397 @@ def calculate_portfolio_weights(df, latest_nav, goal_mappings):
 
     return combined_df
 
-def calculate_xirr(df, latest_nav, goal_mappings):
-    """Calculate XIRR for portfolio and individual schemes"""
-    schemes = df['scheme_name'].unique()
-    xirr_results = {}
-
-    portfolio_growth = []  # To store portfolio value for each date
-
-    for scheme in schemes:
-        transactions = df[df['scheme_name'] == scheme].copy()
-        if not transactions.empty:
-            # Get the latest units and NAV
-            latest_units = transactions['cumulative_units'].iloc[-1]
-            nav = latest_nav.loc[latest_nav['code'] == transactions['code'].iloc[0], 'nav_value'].values[0]
-            latest_value = latest_units * nav
-            
-            # Prepare cashflows including the final value
-            scheme_cashflows = transactions[['date', 'cashflow']].copy()
-            final_cashflow = pd.DataFrame({
-                'date': [datetime.now()],
-                'cashflow': [latest_value]  # Positive because it's money coming in
-            })
-            
-            scheme_transactions = pd.concat([scheme_cashflows, final_cashflow])
-            rate = xirr(scheme_transactions)
-            xirr_results[scheme] = round(rate * 100, 1) if rate is not None else 0
-
-    # Calculate portfolio growth and overall XIRR
-    unique_dates = df['date'].sort_values().unique()
-
-    for date in unique_dates:
-        # Get all transactions up to this date
+def calculate_portfolio_vs_benchmark(df, latest_nav, goal_mappings, benchmark_df):
+    """Calculate portfolio value over time vs benchmark performance"""
+    if df.empty or benchmark_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    
+    # Convert dates to datetime
+    df['date'] = pd.to_datetime(df['date'])
+    benchmark_df['date'] = pd.to_datetime(benchmark_df['date'])
+    
+    # Get the oldest date from portfolio
+    oldest_portfolio_date = df['date'].min()
+    
+    # Filter benchmark data to start from the oldest portfolio date
+    benchmark_df = benchmark_df[benchmark_df['date'] >= oldest_portfolio_date].copy()
+    
+    if benchmark_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    
+    # Get all unique dates from portfolio transactions
+    portfolio_dates = df['date'].sort_values().unique()
+    
+    portfolio_growth = []
+    benchmark_growth = []
+    
+    # Initialize benchmark tracking
+    benchmark_units = 0
+    benchmark_invested = 0
+    
+    for date in portfolio_dates:
+        # Calculate portfolio value as of this date
         transactions_up_to_date = df[df['date'] <= date].copy()
         
-        # For each scheme, get the units as of this date along with the code
+        # Portfolio value calculation
         current_units = transactions_up_to_date.groupby(['scheme_name', 'code'])['cumulative_units'].last().reset_index()
         current_units = current_units.merge(latest_nav, on='code', how='left')
         current_units['current_value'] = current_units['cumulative_units'] * current_units['nav_value']
         
-        # Include debt investments in the portfolio value
-        debt_value_on_date = goal_mappings[goal_mappings['investment_type'] == 'Debt']['current_value'].sum()
-        total_value_on_date = current_units['current_value'].sum() + debt_value_on_date
+        # Include debt investments in the portfolio value (assuming they remain constant)
+        debt_value = goal_mappings[goal_mappings['investment_type'] == 'Debt']['current_value'].sum()
+        portfolio_value = current_units['current_value'].sum() + debt_value
         
-        portfolio_growth.append({'date': date, 'value': total_value_on_date})
-
-    # Calculate overall portfolio XIRR
-    if not df.empty:
-        # Get all cashflows (investments and redemptions)
-        portfolio_cashflows = df[['date', 'cashflow']].copy()
-        
-        # Calculate final portfolio value
-        final_units = df.groupby(['scheme_name', 'code'])['cumulative_units'].last().reset_index()
-        final_units = final_units.merge(latest_nav, on='code', how='left')
-        final_units['current_value'] = final_units['cumulative_units'] * final_units['nav_value']
-        debt_final_value = goal_mappings[goal_mappings['investment_type'] == 'Debt']['current_value'].sum()
-        final_portfolio_value = final_units['current_value'].sum() + debt_final_value
-        
-        # Add final value as a cashflow
-        final_cashflow = pd.DataFrame({
-            'date': [datetime.now()],
-            'cashflow': [final_portfolio_value]
+        portfolio_growth.append({
+            'date': date,
+            'portfolio_value': portfolio_value
         })
         
-        portfolio_transactions = pd.concat([portfolio_cashflows, final_cashflow])
-        portfolio_xirr = xirr(portfolio_transactions)
-        xirr_results['Portfolio'] = round(portfolio_xirr * 100, 1) if portfolio_xirr is not None else 0
-
-    # Calculate Mutual Fund Portfolio XIRR (excluding debt investments)
-    if not df.empty:
-        mf_cashflows = df[['date', 'cashflow']].copy()
+        # Calculate benchmark value as of this date
+        # Get new investments on this date
+        new_investments = df[df['date'] == date]
+        new_investment_amount = new_investments[
+            new_investments['transaction_type'].isin(['invest', 'switch_in'])
+        ]['amount'].sum()
         
-        final_mf_units = df.groupby(['scheme_name', 'code'])['cumulative_units'].last().reset_index()
-        final_mf_units = final_mf_units.merge(latest_nav, on='code', how='left')
-        final_mf_value = (final_mf_units['cumulative_units'] * final_mf_units['nav_value']).sum()
+        if new_investment_amount > 0:
+            # Find benchmark price on or closest to this date
+            benchmark_on_date = benchmark_df[benchmark_df['date'] <= date]
+            if not benchmark_on_date.empty:
+                benchmark_price_on_date = benchmark_on_date['price'].iloc[-1]
+                
+                if benchmark_price_on_date > 0:
+                    # Buy benchmark units with the same investment amount
+                    units_bought = new_investment_amount / benchmark_price_on_date
+                    benchmark_units += units_bought
+                    benchmark_invested += new_investment_amount
         
-        mf_final_cashflow = pd.DataFrame({
-            'date': [datetime.now()],
-            'cashflow': [final_mf_value]
+        # Calculate current benchmark value
+        benchmark_on_date = benchmark_df[benchmark_df['date'] <= date]
+        if not benchmark_on_date.empty and benchmark_units > 0:
+            current_benchmark_price = benchmark_on_date['price'].iloc[-1]
+            benchmark_value = benchmark_units * current_benchmark_price
+        else:
+            benchmark_value = benchmark_invested
+        
+        benchmark_growth.append({
+            'date': date,
+            'benchmark_value': benchmark_value,
+            'benchmark_invested': benchmark_invested
         })
-        
-        mf_transactions = pd.concat([mf_cashflows, mf_final_cashflow])
-        mf_xirr = xirr(mf_transactions)
-        xirr_results['Mutual Fund Portfolio'] = round(mf_xirr * 100, 1) if mf_xirr is not None else 0
+    
+    portfolio_df = pd.DataFrame(portfolio_growth)
+    benchmark_df_result = pd.DataFrame(benchmark_growth)
+    
+    return portfolio_df, benchmark_df_result
 
-    return xirr_results, pd.DataFrame(portfolio_growth)
+def calculate_annual_performance(df, latest_nav, goal_mappings, benchmark_df):
+    """Calculate annual portfolio value and benchmark performance"""
+    if df.empty or benchmark_df.empty:
+        return pd.DataFrame()
+    
+    # Convert dates to datetime
+    df['date'] = pd.to_datetime(df['date'])
+    benchmark_df['date'] = pd.to_datetime(benchmark_df['date'])
+    
+    # Get all unique years in the data
+    min_year = df['date'].dt.year.min()
+    max_year = datetime.now().year
+    years = range(min_year, max_year + 1)
+    
+    annual_data = []
+    annual_data = []
+    
+    for year in years:
+        year_end = datetime(year, 12, 31)
+        # Calculate portfolio value at year end
+        portfolio_transactions = df[df['date'] <= year_end].copy()
+        
+        if not portfolio_transactions.empty:
+            # Get portfolio value
+            final_units = portfolio_transactions.groupby(['scheme_name', 'code'])['cumulative_units'].last().reset_index()
+            final_units = final_units.merge(latest_nav, on='code', how='left')
+            final_units['current_value'] = final_units['cumulative_units'] * final_units['nav_value']
+            debt_final_value = goal_mappings[goal_mappings['investment_type'] == 'Debt']['current_value'].sum()
+            portfolio_value = final_units['current_value'].sum() + debt_final_value
+            
+            # Calculate total invested amount up to this year
+            invested_amount = portfolio_transactions[
+                portfolio_transactions['transaction_type'].isin(['invest', 'switch_in'])
+            ]['amount'].sum()
+            
+            # Calculate benchmark performance
+            investments_up_to_year = df[df['date'] <= year_end]
+            total_benchmark_investment = investments_up_to_year[
+                investments_up_to_year['transaction_type'].isin(['invest', 'switch_in'])
+            ]['amount'].sum()
+            
+            # Calculate benchmark units accumulated up to this year
+            benchmark_units_year = 0
+            for _, row in investments_up_to_year[
+                investments_up_to_year['transaction_type'].isin(['invest', 'switch_in'])
+            ].iterrows():
+                investment_date = row['date']
+                investment_amount = row['amount']
+                
+                # Find benchmark price on or before investment date
+                benchmark_on_date = benchmark_df[benchmark_df['date'] <= investment_date]
+                if not benchmark_on_date.empty:
+                    benchmark_price_on_date = benchmark_on_date['price'].iloc[-1]
+                    if benchmark_price_on_date > 0:
+                        units_bought = investment_amount / benchmark_price_on_date
+                        benchmark_units_year += units_bought
+            
+            # Get benchmark price at year end
+            benchmark_at_year_end = benchmark_df[benchmark_df['date'] <= year_end]
+            if not benchmark_at_year_end.empty and benchmark_units_year > 0:
+                benchmark_price_at_year_end = benchmark_at_year_end['price'].iloc[-1]
+                benchmark_value = benchmark_units_year * benchmark_price_at_year_end
+            else:
+                benchmark_value = total_benchmark_investment
+            
+            # Calculate returns
+            portfolio_return = ((portfolio_value - invested_amount) / invested_amount * 100) if invested_amount > 0 else 0
+            benchmark_return = ((benchmark_value - total_benchmark_investment) / total_benchmark_investment * 100) if total_benchmark_investment > 0 else 0
+            
+            annual_data.append({
+                'year': year,
+                'portfolio_value': portfolio_value,
+                'benchmark_value': benchmark_value,
+                'invested_amount': invested_amount,
+                'portfolio_return': portfolio_return,
+                'benchmark_return': benchmark_return
+            })
+    
+    return pd.DataFrame(annual_data)
+
+from pyxirr import xirr  # You'll need to install the xirr package: pip install xirr
+
+def calculate_equity_xirr(df, latest_nav):
+    """Calculate XIRR for equity portion of the portfolio"""
+    try:
+        # 1. Select equity transactions
+        ts = df[df['transaction_type'].isin(['invest','redeem','switch_in','switch_out'])]
+        if ts.empty:
+            return 0.0
+
+        # 2. Build cashflows: negative for invest/switch_in, positive for redeem/switch_out
+        dates, amounts = [], []
+        for _, row in ts.iterrows():
+            dates.append(row['date'])
+            amt = -row['amount'] if row['transaction_type'] in ('invest','switch_in') else row['amount']
+            amounts.append(float(amt))
+
+        # 3. Add current value as final inflow
+        total_current = 0.0
+        for code in df['code'].unique():
+            units = df.loc[df['code'] == code, 'cumulative_units'].iloc[-1]
+            navs = latest_nav.loc[latest_nav['code'] == code, 'nav_value']
+            if not navs.empty and not pd.isna(navs.values[0]):
+                total_current += units * float(navs.values[0])
+
+        if total_current > 0:
+            dates.append(datetime.now())
+            amounts.append(float(total_current))
+
+        # 4. Calculate XIRR
+        if len(dates) >= 2 and any(a < 0 for a in amounts) and any(a > 0 for a in amounts):
+            rate = xirr(dates, amounts)
+            return rate * 100.0  # convert to percentage
+
+        return 0.0
+    except Exception as e:
+        st.error(f"Error in XIRR calculation: {e}")
+        return 0.0
+
+
 
 def main():
     st.set_page_config(page_title="Portfolio Analysis", layout="wide")
-    st.title("Portfolio Analysis Dashboard")
+    st.title("Portfolio Value Analysis Dashboard")
 
-    df = get_portfolio_data()
-    latest_nav = get_latest_nav()
-    goal_mappings = get_goal_mappings()
+    try:
+        df = get_portfolio_data()
+        latest_nav = get_latest_nav()
+        goal_mappings = get_goal_mappings()
+        benchmark_df = get_benchmark_data()
 
-    if df.empty or latest_nav.empty:
-        st.warning("No data found. Please ensure portfolio data and NAV data are available.")
-        return
+        if df.empty or latest_nav.empty:
+            st.warning("No data found. Please ensure portfolio data and NAV data are available.")
+            return
 
-    df['date'] = pd.to_datetime(df['date'])
-    df = prepare_cashflows(df)
-    df = calculate_units(df)
+        df['date'] = pd.to_datetime(df['date'])
+        df = prepare_cashflows(df)
+        df = calculate_units(df)
 
-    # Calculate XIRR and Portfolio Growth
-    xirr_results, portfolio_growth_df = calculate_xirr(df, latest_nav, goal_mappings)
+        # Calculate portfolio vs benchmark performance
+        portfolio_growth_df, benchmark_growth_df = calculate_portfolio_vs_benchmark(df, latest_nav, goal_mappings, benchmark_df)
+        
+        # Calculate annual performance
+        annual_performance_df = calculate_annual_performance(df, latest_nav, goal_mappings, benchmark_df)
 
-    # Calculate portfolio weights including debt investments
-    weights_df = calculate_portfolio_weights(df, latest_nav, goal_mappings)
+        # Calculate portfolio weights including debt investments
+        weights_df = calculate_portfolio_weights(df, latest_nav, goal_mappings)
 
-    # Calculate equity and debt values
-    equity_value = weights_df[weights_df['scheme_name'].isin(df['scheme_name'].unique())]['current_value'].sum()
-    debt_value = goal_mappings[goal_mappings['investment_type'] == 'Debt']['current_value'].sum()
-    total_portfolio_value = equity_value + debt_value
+        # Calculate equity and debt values
+        equity_value = weights_df[weights_df['scheme_name'].isin(df['scheme_name'].unique())]['current_value'].sum()
+        debt_value = goal_mappings[goal_mappings['investment_type'] == 'Debt']['current_value'].sum()
+        total_portfolio_value = equity_value + debt_value
 
-    equity_percent = (equity_value / total_portfolio_value) * 100 if total_portfolio_value > 0 else 0
-    debt_percent = (debt_value / total_portfolio_value) * 100 if total_portfolio_value > 0 else 0
+        equity_percent = (equity_value / total_portfolio_value) * 100 if total_portfolio_value > 0 else 0
+        debt_percent = (debt_value / total_portfolio_value) * 100 if total_portfolio_value > 0 else 0
 
-    # Calculate total invested amount (only investments, not redemptions)
-    mf_invested = df[df['transaction_type'].isin(['invest', 'switch_in'])]['amount'].sum()
-    debt_invested = goal_mappings[goal_mappings['investment_type'] == 'Debt']['current_value'].sum()
-    total_invested = mf_invested + debt_invested
+        # Calculate total invested amount for equity only
+        equity_invested = df[df['transaction_type'].isin(['invest', 'switch_in'])]['amount'].sum()
+        
+        # Calculate equity XIRR
+        equity_xirr = calculate_equity_xirr(df, latest_nav)
 
-    # Display Overall Portfolio Metrics - 2 metrics per row
-    st.subheader("Overall Portfolio Metrics")
-    
-    # Row 1: Mutual Fund Portfolio XIRR and Current Portfolio Value
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Mutual Fund Portfolio XIRR", f"{xirr_results['Mutual Fund Portfolio']:.1f}%")
-    with col2:
-        st.metric("Current Portfolio Value (including EPF and PPF)", format_indian_number(total_portfolio_value))
-    
-    # Row 2: Equity and Debt Values
-    col3, col4 = st.columns(2)
-    with col3:
-        st.metric("Equity Mutual Funds", f"{format_indian_number(equity_value)} ({equity_percent:.1f}%)")
-    with col4:
-        st.metric("Debt Funds along with EPF and PPF", f"{format_indian_number(debt_value)} ({debt_percent:.1f}%)")
-    
-    # Row 3: Total Invested Amount (centered in one column)
-    col5, col6 = st.columns(2)
-    with col5:
-        st.metric("Total Invested Amount", format_indian_number(total_invested))
+        # Display Overall Portfolio Metrics
+        st.subheader("Overall Portfolio Metrics")
+        
+        # Row 1: Current Portfolio Value
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Current Portfolio Value (including Equity and Debt)", format_indian_number(total_portfolio_value))
+        with col2:
+            st.metric("Total Invested Equity", format_indian_number(equity_invested))
+        
+        # Row 2: Equity and Debt Values with percentages
+        col3, col4 = st.columns(2)
+        with col3:
+            st.metric("Current Equity Value", f"{format_indian_number(equity_value)} ({equity_percent:.1f}%)")
+        with col4:
+            st.metric("Current Debt Value", f"{format_indian_number(debt_value)} ({debt_percent:.1f}%)")
+        
+        # Row 3: Equity XIRR
+        # Row 3: Equity XIRR
+        col5, _ = st.columns(2)
+        with col5:
+            st.metric("Equity XIRR", f"{equity_xirr:.1f}%")
+        weights_df['Current Value'] = weights_df['current_value'].apply(format_indian_number)
+        weights_df['Weight (%)'] = weights_df['weight'].round(2)
+        
+        # Display formatted columns
+        display_metrics = weights_df[['scheme_name', 'Current Value', 'Weight (%)']]
+        display_metrics.columns = ['Scheme Name', 'Current Value', 'Weight (%)']
+        st.dataframe(display_metrics)
 
-    # Display Individual Fund Metrics
-    st.subheader("Individual Fund Metrics")
-    fund_metrics = weights_df[['scheme_name', 'current_value', 'weight']].copy()
-    fund_metrics['Current Value'] = fund_metrics['current_value'].apply(format_indian_number)
-    fund_metrics['Weight (%)'] = fund_metrics['weight'].round(2)
-    fund_metrics['XIRR (%)'] = fund_metrics['scheme_name'].map(xirr_results)
-    
-    # Display formatted columns
-    display_metrics = fund_metrics[['scheme_name', 'Current Value', 'Weight (%)', 'XIRR (%)']]
-    display_metrics.columns = ['Scheme Name', 'Current Value', 'Weight (%)', 'XIRR (%)']
-    st.dataframe(display_metrics)
+        # Display Portfolio Value vs Benchmark Over Time
+        st.subheader("Portfolio Value vs Benchmark Over Time")
+        if not portfolio_growth_df.empty and not benchmark_growth_df.empty:
+            # Merge the dataframes
+            merged_df = pd.merge(portfolio_growth_df, benchmark_growth_df, on='date', how='inner')
+            
+            # Create the plot
+            fig = go.Figure()
+            
+            # Add portfolio line
+            fig.add_trace(go.Scatter(
+                x=merged_df['date'],
+                y=merged_df['portfolio_value'],
+                mode='lines',
+                name='Portfolio Value',
+                line=dict(color='blue', width=2),
+                hovertemplate='Date: %{x}<br>Portfolio Value: ₹%{y:,.0f}<extra></extra>'
+            ))
+            
+            # Add benchmark line
+            fig.add_trace(go.Scatter(
+                x=merged_df['date'],
+                y=merged_df['benchmark_value'],
+                mode='lines',
+                name='Benchmark Value',
+                line=dict(color='red', width=2),
+                hovertemplate='Date: %{x}<br>Benchmark Value: ₹%{y:,.0f}<extra></extra>'
+            ))
+            
+            fig.update_layout(
+                title='Portfolio Value vs Benchmark Performance Over Time',
+                xaxis_title='Date',
+                yaxis_title='Value (₹)',
+                hovermode='x unified',
+                legend=dict(x=0.02, y=0.98),
+                height=400
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Show current comparison
+            if not merged_df.empty:
+                latest_portfolio = merged_df['portfolio_value'].iloc[-1]
+                latest_benchmark = merged_df['benchmark_value'].iloc[-1]
+                latest_invested = merged_df['benchmark_invested'].iloc[-1]
+                
+                portfolio_return = ((latest_portfolio - latest_invested) / latest_invested * 100) if latest_invested > 0 else 0
+                benchmark_return = ((latest_benchmark - latest_invested) / latest_invested * 100) if latest_invested > 0 else 0
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Portfolio Return", f"{portfolio_return:.1f}%")
+                with col2:
+                    st.metric("Benchmark Return", f"{benchmark_return:.1f}%")
+                with col3:
+                    outperformance = portfolio_return - benchmark_return
+                    st.metric("Outperformance", f"{outperformance:.1f}%")
+        else:
+            st.warning("Insufficient data to calculate portfolio vs benchmark comparison.")
 
-    # Display Portfolio Growth Over Time
-    st.subheader("Portfolio Growth Over Time")
-    growth_chart_df = portfolio_growth_df.copy()
-    growth_chart_df['value'] = growth_chart_df['value'].round(2)
-    st.line_chart(growth_chart_df.rename(columns={'value': 'Portfolio Value'}).set_index('date'))
+        # Display Annual Performance Comparison
+        st.subheader("Annual Performance: Portfolio vs Benchmark")
+        if not annual_performance_df.empty:
+            # Create the plot
+            fig = go.Figure()
+            
+            # Add portfolio return line
+            fig.add_trace(go.Scatter(
+                x=annual_performance_df['year'],
+                y=annual_performance_df['portfolio_return'],
+                mode='lines+markers',
+                name='Portfolio Return',
+                line=dict(color='blue', width=2),
+                hovertemplate='Year: %{x}<br>Portfolio Return: %{y:.1f}%<extra></extra>'
+            ))
+            
+            # Add benchmark return line
+            fig.add_trace(go.Scatter(
+                x=annual_performance_df['year'],
+                y=annual_performance_df['benchmark_return'],
+                mode='lines+markers',
+                name='Benchmark Return',
+                line=dict(color='red', width=2),
+                hovertemplate='Year: %{x}<br>Benchmark Return: %{y:.1f}%<extra></extra>'
+            ))
+            
+            fig.update_layout(
+                title='Annual Returns: Portfolio vs Benchmark',
+                xaxis_title='Year',
+                yaxis_title='Return (%)',
+                hovermode='x unified',
+                legend=dict(x=0.02, y=0.98),
+                height=400
+            )
+            
+            # Show years as integers on x-axis
+            fig.update_xaxes(type='category')
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Show annual performance table
+            display_annual = annual_performance_df.copy()
+            display_annual['Portfolio Value'] = display_annual['portfolio_value'].apply(format_indian_number)
+            display_annual['Benchmark Value'] = display_annual['benchmark_value'].apply(format_indian_number)
+            display_annual['Invested Amount'] = display_annual['invested_amount'].apply(format_indian_number)
+            display_annual['Portfolio Return (%)'] = display_annual['portfolio_return'].round(1)
+            display_annual['Benchmark Return (%)'] = display_annual['benchmark_return'].round(1)
+            display_annual['Outperformance (%)'] = (display_annual['portfolio_return'] - display_annual['benchmark_return']).round(1)
+            
+            st.dataframe(display_annual[['year', 'Portfolio Value', 'Benchmark Value', 'Invested Amount', 
+                                       'Portfolio Return (%)', 'Benchmark Return (%)', 'Outperformance (%)']])
+        else:
+            st.warning("Insufficient data to calculate annual performance comparison.")
 
-    # Display Goal-wise Equity and Debt Split
-    if not goal_mappings.empty:
+        # Goal-wise Equity and Debt Split
         st.subheader("Goal-wise Equity and Debt Split")
         
         goals = goal_mappings['goal_name'].unique()
@@ -415,6 +630,10 @@ def main():
                         st.write(f"**Total Value:** {format_indian_number(total_value)}")
                         st.write(f"**Equity:** {equity_percent:.1f}% ({format_indian_number(equity_value)})")
                         st.write(f"**Debt:** {debt_percent:.1f}% ({format_indian_number(debt_value)})")
+
+    except Exception as e:
+        st.error(f"An error occurred: {str(e)}")
+        st.error("Please check your database connection and data integrity.")
 
 if __name__ == "__main__":
     main()
