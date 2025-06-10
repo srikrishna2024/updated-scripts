@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import json
+import os
 
 # -------------------- DATABASE CONFIG --------------------
 DB_PARAMS = {
@@ -22,6 +24,21 @@ DB_PARAMS = {
 
 def get_db_connection():
     return psycopg.connect(**DB_PARAMS)
+
+# -------------------- USER PREFERENCES --------------------
+def load_user_prefs():
+    """Load user preferences from JSON file"""
+    prefs_file = "user_prefs.json"
+    if os.path.exists(prefs_file):
+        with open(prefs_file, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_user_prefs(prefs):
+    """Save user preferences to JSON file"""
+    prefs_file = "user_prefs.json"
+    with open(prefs_file, 'w') as f:
+        json.dump(prefs, f, indent=4)
 
 # -------------------- UTILITY FUNCTIONS --------------------
 def format_indian_currency(amount):
@@ -48,6 +65,42 @@ def reset_database():
             conn.commit()
     st.success("All retirement planning data has been reset!")
     st.rerun()
+
+def create_speedometer(current, target, title):
+    """Create a speedometer-style gauge chart with values in Crores"""
+    current_cr = current / 10000000
+    target_cr = target / 10000000
+    
+    fig = go.Figure(go.Indicator(
+        mode = "gauge+number",
+        value = current_cr,
+        number = {'suffix': " Cr", 'valueformat': ".2f"},
+        domain = {'x': [0, 1], 'y': [0, 1]},
+        title = {'text': title},
+        gauge = {
+            'axis': {
+                'range': [None, target_cr],
+                'tickformat': ".1f",
+                'ticksuffix': " Cr"
+            },
+            'bar': {'color': "darkblue"},
+            'steps': [
+                {'range': [0, target_cr*0.5], 'color': "lightgray"},
+                {'range': [target_cr*0.5, target_cr*0.8], 'color': "gray"},
+                {'range': [target_cr*0.8, target_cr], 'color': "lightgreen"}
+            ],
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': current_cr
+            }
+        }
+    ))
+    fig.update_layout(
+        height=300,
+        margin=dict(l=20, r=20, t=50, b=20)
+    )
+    return fig
 
 # -------------------- DATABASE SETUP --------------------
 def initialize_database():
@@ -209,7 +262,9 @@ def calculate_retirement_corpus(
         years_remaining = years_to_retirement - year
         
         # Calculate target allocation (glide path)
-        equity_pct = max(0.3, 0.8 - (0.5 * (year / years_to_retirement)))  # Glide from 80% to 30% equity
+        progress = year / years_to_retirement
+        equity_pct = 0.3 + (0.5 / (1 + np.exp(6 * (progress - 0.6))))  # Smoother transition
+        equity_pct = max(0.3, min(0.8, equity_pct))  # Clamp between 30% and 80%
         debt_pct = 1 - equity_pct
         
         # Calculate investment growth
@@ -670,35 +725,54 @@ def retirement_planner_tab():
     # Initialize database
     initialize_database()
     
+    # Load user preferences
+    user_prefs = load_user_prefs()
+    
     # Check for existing plans
     existing_plans = get_retirement_plans()
     has_baseline = not existing_plans.empty and 'BASELINE' in existing_plans['plan_type'].values
     
-    # Sidebar inputs
+    # Sidebar inputs with saved preferences
     with st.sidebar:
         st.subheader("🔢 Personal Details")
-        current_age = st.number_input("Your Current Age", min_value=18, max_value=70, value=30)
-        retirement_age = st.number_input("Planned Retirement Age", min_value=current_age+1, max_value=80, value=60)
-        life_expectancy = st.number_input("Life Expectancy", min_value=retirement_age+1, max_value=120, value=90)
+        current_age = st.number_input("Your Current Age", min_value=18, max_value=70, 
+                                    value=int(user_prefs.get('current_age', 30)))
+        retirement_age = st.number_input("Planned Retirement Age", min_value=current_age+1, max_value=80, 
+                                       value=int(user_prefs.get('retirement_age', 60)))
+        life_expectancy = st.number_input("Life Expectancy", min_value=retirement_age+1, max_value=120, 
+                                        value=int(user_prefs.get('life_expectancy', 90)))
         
         st.subheader("💰 Expenses")
         current_monthly_expenses = st.number_input("Current Monthly Living Expenses (₹)", 
-                                                min_value=10000, value=50000, step=5000)
+                                                min_value=10000, 
+                                                value=int(user_prefs.get('current_monthly_expenses', 50000)), 
+                                                step=5000)
         recurring_annual_expenses = st.number_input("Annual Recurring Expenses (₹)", 
-                                                 min_value=0, value=100000, step=10000)
+                                                 min_value=0, 
+                                                 value=int(user_prefs.get('recurring_annual_expenses', 100000)), 
+                                                 step=10000)
         annual_expenses_growth = st.slider("Expected Annual Expenses Growth %", 
-                                        min_value=0.0, max_value=15.0, value=6.0, step=0.1) / 100
+                                        min_value=0.0, max_value=15.0, 
+                                        value=float(user_prefs.get('annual_expenses_growth', 6.0)), 
+                                        step=0.1) / 100
         post_retirement_inflation = st.slider("Post-Retirement Inflation %", 
-                                           min_value=0.0, max_value=10.0, value=5.0, step=0.1) / 100
+                                           min_value=0.0, max_value=10.0, 
+                                           value=float(user_prefs.get('post_retirement_inflation', 5.0)), 
+                                           step=0.1) / 100
         
         st.subheader("📈 Expected Returns")
         equity_return = st.slider("Post-Tax Equity Return %", 
-                               min_value=0.0, max_value=20.0, value=10.0, step=0.1) / 100
+                               min_value=0.0, max_value=20.0, 
+                               value=float(user_prefs.get('equity_return', 10.0)), 
+                               step=0.1) / 100
         debt_return = st.slider("Post-Tax Debt Return %", 
-                             min_value=0.0, max_value=15.0, value=6.0, step=0.1) / 100
+                             min_value=0.0, max_value=15.0, 
+                             value=float(user_prefs.get('debt_return', 6.0)), 
+                             step=0.1) / 100
         
         st.subheader("💵 Current Investments")
-        auto_load = st.checkbox("Auto-load retirement investments", value=True)
+        auto_load = st.checkbox("Auto-load retirement investments", 
+                              value=user_prefs.get('auto_load', True))
         
         if auto_load:
             with st.spinner("Loading retirement investments..."):
@@ -707,9 +781,35 @@ def retirement_planner_tab():
             st.metric("Retirement Debt", format_indian_currency(current_debt))
         else:
             current_equity = st.number_input("Current Equity Investments (₹)", 
-                                          min_value=0, value=500000, step=10000)
+                                          min_value=0, 
+                                          value=int(user_prefs.get('current_equity', 500000)), 
+                                          step=10000)
             current_debt = st.number_input("Current Debt Investments (₹)", 
-                                        min_value=0, value=300000, step=10000)
+                                        min_value=0, 
+                                        value=int(user_prefs.get('current_debt', 300000)), 
+                                        step=10000)
+        
+        # Save preferences when any input changes
+        if st.button("Save Current Settings", type="secondary"):
+            user_prefs.update({
+                'current_age': current_age,
+                'retirement_age': retirement_age,
+                'life_expectancy': life_expectancy,
+                'current_monthly_expenses': current_monthly_expenses,
+                'recurring_annual_expenses': recurring_annual_expenses,
+                'annual_expenses_growth': annual_expenses_growth * 100,  # Convert back to percentage
+                'post_retirement_inflation': post_retirement_inflation * 100,
+                'equity_return': equity_return * 100,
+                'debt_return': debt_return * 100,
+                'auto_load': auto_load,
+                'current_equity': current_equity,
+                'current_debt': current_debt,
+                # Add cashflow values from session state if available
+                'actual_equity': st.session_state.get('actual_equity_input', 0),
+                'actual_debt': st.session_state.get('actual_debt_input', 0)
+            })
+            save_user_prefs(user_prefs)
+            st.success("Settings saved for next session!")
         
         # Reset button
         if st.button("Reset All Data", type="secondary"):
@@ -779,6 +879,83 @@ def retirement_planner_tab():
                 st.metric("Debt Return", f"{baseline_plan['debt_return']*100:.1f}%")
                 st.metric("Annual Expense Growth", f"{baseline_plan['annual_expenses_growth']*100:.1f}%")
                 st.metric("Post-Retirement Inflation", f"{baseline_plan['post_retirement_inflation']*100:.1f}%")
+        
+        # Show goal achievement speedometer
+        current_equity, current_debt = get_retirement_investments()
+        current_total = current_equity + current_debt
+        target_total = baseline_plan['corpus_needed']
+        progress_pct = min(100, (current_total / target_total) * 100)
+        
+        st.subheader("🎯 Goal Achievement")
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            st.plotly_chart(create_speedometer(
+                current=current_total,
+                target=target_total,
+                title=f"Progress: {progress_pct:.1f}%"
+            ), use_container_width=True)
+        # Dynamic message based on progress
+        if progress_pct < 25:
+            message = "Small steps lead to big dreams. Start now!"
+        elif 25 <= progress_pct < 50:
+             message = "You're building momentum — great job!"
+        elif 50 <= progress_pct < 75:
+             message = "Stay consistent, you're almost there!"
+        elif 75 <= progress_pct < 90:
+            message = "Incredible! Just a bit more!"
+        elif 90 <= progress_pct < 100:
+            message = "Almost there! Final push needed."
+        else:
+             message = "Target crushed! You're a wealth builder!"
+        
+        # Next milestone calculation
+        next_milestone = None
+        milestones = [1.25, 1.5, 2, 3]
+        for m in milestones:
+            if current_total < target_total * m:
+                next_milestone = target_total * m
+                break
+
+        # Calculate years to next milestone if applicable
+        milestone_text = ""
+        if next_milestone and current_total > 0:
+            required_growth = (next_milestone / current_total) ** (1/(baseline_plan['retirement_age'] - baseline_plan['current_age']))
+            years_to_milestone = int(np.log(next_milestone / current_total) / np.log(1 + required_growth))
+            milestone_text = f"**Next milestone**: ₹{format_indian_currency(next_milestone)} by age {baseline_plan['current_age'] + years_to_milestone}"
+
+        # Display messages below speedometer
+        with col1:
+            st.markdown(f"<div style='text-align: center; margin-top: -20px;'>{message}</div>", unsafe_allow_html=True)
+            if progress_pct >= 25 and current_total > 0:
+                st.markdown("---")
+                st.markdown("**Projected Milestones:**")
+        
+            # Define milestone percentages (25%, 50%, 75%, 100%, 125%, etc.)
+            milestones = [
+                (0.50, "50% of target"),
+                (0.75, "75% of target"),
+                (1.00, "100% of target"),
+                (1.25, "25% above target"),
+                (1.50, "50% above target")
+            ]
+            # Calculate years to reach each milestone
+            current_age = baseline_plan['current_age']
+            retirement_age = baseline_plan['retirement_age']
+            years_remaining = retirement_age - current_age
+            current_growth_rate = (target_total / current_total) ** (1/years_remaining) - 1
+
+            for milestone, label in milestones:
+                milestone_value = target_total * milestone
+                if current_total < milestone_value:
+                    years_needed = int(np.ceil(np.log(milestone_value / current_total) / np.log(1 + current_growth_rate)))
+                    age_at_milestone = current_age + years_needed
+                    st.markdown(f"- {format_indian_currency(milestone_value)} ({label}) by age {age_at_milestone}")
+                else:
+                    st.markdown(f"- {format_indian_currency(milestone_value)} ({label}) ✅ Achieved!")
+        with col2:
+            st.metric("Current Corpus", format_indian_currency(current_total))
+            st.metric("Target Corpus", format_indian_currency(target_total))
+            st.metric("Remaining", format_indian_currency(max(0, target_total - current_total)))
         
         # Show glide path
         st.subheader("📉 Asset Allocation Glide Path")
@@ -988,6 +1165,9 @@ def cashflow_planner_tab():
         st.warning("Please create a baseline retirement plan first in the Retirement Planner tab.")
         return
     
+    # Load user preferences
+    user_prefs = load_user_prefs()
+    
     baseline_plan = existing_plans[existing_plans['plan_type'] == 'BASELINE'].iloc[0]
     
     # Get current investments
@@ -1007,21 +1187,36 @@ def cashflow_planner_tab():
         current_debt=current_debt,
         life_expectancy=baseline_plan['life_expectancy']
     )
-    
+
     # User inputs for actual investments
     st.subheader("Your Actual Monthly Investments")
     col1, col2 = st.columns(2)
     with col1:
-        actual_equity = st.number_input("Actual Equity Investment (₹ per month)", 
-                                     min_value=0, 
-                                     value=int(monthly_investments['Equity Investment'].mean()),
-                                     step=1000)
+        actual_equity = st.number_input(
+            "Actual Equity Investment (₹ per month)", 
+            min_value=0, 
+            value=int(user_prefs.get('actual_equity', int(monthly_investments['Equity Investment'].mean()))), 
+            step=1000,
+            key='actual_equity_input'
+        )
     with col2:
-        actual_debt = st.number_input("Actual Debt Investment (₹ per month)", 
-                                   min_value=0, 
-                                   value=int(monthly_investments['Debt Investment'].mean()),
-                                   step=1000)
-    
+        actual_debt = st.number_input(
+            "Actual Debt Investment (₹ per month)", 
+            min_value=0, 
+            value=int(user_prefs.get('actual_debt', int(monthly_investments['Debt Investment'].mean()))), 
+            step=1000,
+            key='actual_debt_input'
+        )
+
+    # Add Save button for cashflow settings
+    if st.button("💾 Save Investment Settings", key='save_cashflow_settings'):
+        user_prefs.update({
+            'actual_equity': actual_equity,
+            'actual_debt': actual_debt
+        })
+        save_user_prefs(user_prefs)
+        st.success("Monthly investment settings saved!")
+
     # Add actual investment columns to the DataFrame
     monthly_investments['Equity Investment Actual'] = actual_equity
     monthly_investments['Debt Investment Actual'] = actual_debt
@@ -1178,7 +1373,6 @@ def cashflow_planner_tab():
     
     st.plotly_chart(fig, use_container_width=True)
     
-    # Rest of the function remains the same...
     # Calculate retirement timeline
     st.subheader("⏳ Retirement Timeline Projection")
     actual_corpus = monthly_investments['Actual Equity Value'] + monthly_investments['Actual Debt Value']
@@ -1225,6 +1419,7 @@ def cashflow_planner_tab():
         display_df['Debt Investment'] = display_df['Debt Investment'].apply(format_indian_currency)
         display_df['Total Investment'] = display_df['Total Investment'].apply(format_indian_currency)
         st.dataframe(display_df, hide_index=True, use_container_width=True)
+        
 # -------------------- MAIN APP --------------------
 def main():
     st.set_page_config(
