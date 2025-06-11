@@ -1153,83 +1153,170 @@ def retirement_planner_tab():
 def portfolio_optimizer_tab():
     st.header("📊 Portfolio Optimizer")
     
-    # Load categories
-    with get_db_connection() as conn:
-        categories_df = pd.read_sql(
-            "SELECT DISTINCT scheme_category FROM mutual_fund_master_data WHERE scheme_category IS NOT NULL",
-            conn
-        )
-    categories = sorted(categories_df['scheme_category'].dropna().unique().tolist())
-    
-    # Rolling period selection
-    rolling_period_years = st.slider("Analysis Period (Years)", min_value=1, max_value=10, value=5, step=1)
-    
-    # Main interface with tabs
-    subtab1, subtab2, subtab3 = st.tabs(["📈 Analyze Categories", "🔍 Compare Funds", "🔄 Rebalance Portfolio"])
-    
-    with subtab1:
-        st.subheader("Category Analysis")
-        selected_categories = st.multiselect(
-            "Select up to 3 Fund Categories", 
-            categories, 
-            max_selections=3
-        )
-        
-        if st.button("Analyze Categories", disabled=len(selected_categories) == 0):
-            st.warning("Category analysis would be implemented here")
-    
-    with subtab2:
-        st.subheader("Fund Comparison")
-        # Load all funds for selection
-        with get_db_connection() as conn:
-            query = """
-                SELECT DISTINCT code, scheme_name, scheme_category
-                FROM mutual_fund_master_data
-                ORDER BY scheme_name
-            """
-            df_all_funds = pd.read_sql(query, conn)
-        
-        # Create fund options with category info
-        fund_options = [f"{row['scheme_name']} ({row['scheme_category']})" for _, row in df_all_funds.iterrows()]
-        
-        selected_fund_options = st.multiselect(
-            "Choose 2-3 Funds to Compare", 
-            fund_options, 
-            max_selections=3
-        )
-        
-        if st.button("Compare Funds", disabled=len(selected_fund_options) < 2):
-            st.warning("Fund comparison would be implemented here")
-    
-    with subtab3:
-        st.subheader("Portfolio Rebalancer")
-        if st.button("Analyze Current Allocation"):
-            with st.spinner("Loading your portfolio..."):
-                try:
-                    # Get retirement-specific investments
-                    retirement_equity, retirement_debt = get_retirement_investments()
+    st.subheader("Portfolio Rebalancer")
+    if st.button("Analyze Current Allocation"):
+        with st.spinner("Analyzing your portfolio..."):
+            try:
+                # First get the current retirement investments
+                retirement_equity, retirement_debt = get_retirement_investments()
+                total_portfolio = retirement_equity + retirement_debt
+                
+                if total_portfolio == 0:
+                    st.warning("No retirement investments found. Please add investments tagged for retirement.")
+                    return
+                
+                equity_pct = (retirement_equity / total_portfolio) * 100
+                debt_pct = (retirement_debt / total_portfolio) * 100
+                
+                # Display current allocation
+                st.write("### Current Allocation")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Equity Allocation", f"{equity_pct:.1f}%", 
+                             help="Recommended range: 60-80% based on your age and risk profile")
+                with col2:
+                    st.metric("Debt Allocation", f"{debt_pct:.1f}%", 
+                             help="Recommended range: 20-40% based on your age and risk profile")
+                
+                # Calculate XIRR - Improved version
+                with get_db_connection() as conn:
+                    # Get all transactions for retirement funds
+                    query = """
+                        SELECT pd.date, pd.amount 
+                        FROM portfolio_data pd
+                        JOIN goals g ON pd.code = g.scheme_code
+                        WHERE g.goal_name = 'Retirement'
+                        AND pd.transaction_type IN ('invest', 'switch_in')
+                        ORDER BY pd.date
+                    """
+                    cashflows = pd.read_sql(query, conn)
+                
+                if not cashflows.empty:
+                    # Add current portfolio value as negative cashflow (outflow)
+                    final_cashflow = pd.DataFrame({
+                        'date': [datetime.now()],
+                        'amount': [-total_portfolio]
+                    })
+                    cashflows = pd.concat([cashflows, final_cashflow], ignore_index=True)
                     
-                    # Get all goals
-                    goals = get_goal_mappings()
+                    # Convert dates to ordinal numbers for calculation
+                    cashflows['date_ordinal'] = cashflows['date'].apply(lambda x: x.toordinal())
                     
-                    # Display retirement allocation
-                    st.write("### Retirement Portfolio")
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("Total Equity", format_indian_currency(retirement_equity))
-                    with col2:
-                        st.metric("Total Debt", format_indian_currency(retirement_debt))
+                    # Function to calculate XIRR
+                    def xirr(cashflows):
+                        try:
+                            years = [(d - cashflows['date_ordinal'].iloc[0])/365.0 
+                                    for d in cashflows['date_ordinal']]
+                            residual = 1.0
+                            step = 0.05
+                            guess = 0.1
+                            epsilon = 0.0001
+                            limit = 10000
+                            
+                            for _ in range(limit):
+                                t_r = guess
+                                npv = 0.0
+                                for i, cf in enumerate(cashflows['amount']):
+                                    npv += cf / ((1.0 + t_r)**years[i])
+                                
+                                if abs(npv) < epsilon:
+                                    return t_r
+                                
+                                # Newton-Raphson method
+                                npv_prime = 0.0
+                                for i, cf in enumerate(cashflows['amount']):
+                                    npv_prime += -years[i] * cf / ((1.0 + t_r)**(years[i]+1))
+                                
+                                guess = guess - npv / npv_prime
+                            
+                            return guess
+                        except:
+                            return None
                     
-                    # Show retirement goal investments
-                    retirement_goals = goals[goals['goal_name'] == 'Retirement']
-                    if not retirement_goals.empty:
-                        st.write("#### Retirement Investments")
-                        st.dataframe(retirement_goals[['investment_type', 'scheme_name', 'current_value']]
-                                   .assign(current_value=lambda x: x['current_value'].apply(format_indian_currency)))
+                    # Calculate and display XIRR
+                    calculated_xirr = xirr(cashflows)
+                    if calculated_xirr is not None:
+                        st.metric("Portfolio XIRR", f"{calculated_xirr*100:.1f}%", 
+                                 help="Annualized return since first investment")
+                    else:
+                        st.metric("Portfolio XIRR", "N/A", 
+                                 help="Could not calculate XIRR - check your transaction data")
+                
+                # Get all goals
+                goals = get_goal_mappings()
+                
+                # Show retirement goal investments
+                retirement_goals = goals[goals['goal_name'] == 'Retirement']
+                if not retirement_goals.empty:
+                    st.write("#### Current Retirement Investments")
+                    st.dataframe(retirement_goals[['investment_type', 'scheme_name', 'current_value']]
+                               .assign(current_value=lambda x: x['current_value'].apply(format_indian_currency)))
+                
+                # Allocation recommendations
+                st.write("### Allocation Recommendations")
+                
+                # Get user's current age from preferences or default
+                user_prefs = load_user_prefs()
+                current_age = user_prefs.get('current_age', 30)
+                
+                # Calculate recommended allocation based on age
+                recommended_equity = max(60, 100 - current_age)
+                recommended_debt = 100 - recommended_equity
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Recommended Equity", f"{recommended_equity}%")
+                with col2:
+                    st.metric("Recommended Debt", f"{recommended_debt}%")
+                
+                # Provide specific recommendations
+                if equity_pct < recommended_equity - 5:
+                    st.warning("**Action Needed**: Your equity allocation is lower than recommended")
+                    st.markdown(f"""
+                    - Consider increasing equity allocation by **{recommended_equity - equity_pct:.1f}%**
+                    - Options to rebalance:
+                        - Redirect new investments to equity funds
+                        - Switch from debt to equity funds (up to ₹{format_indian_currency((recommended_equity/100*total_portfolio) - retirement_equity)})
+                    """)
+                elif equity_pct > recommended_equity + 5:
+                    st.warning("**Action Needed**: Your equity allocation is higher than recommended")
+                    st.markdown(f"""
+                    - Consider reducing equity allocation by **{equity_pct - recommended_equity:.1f}%**
+                    - Options to rebalance:
+                        - Redirect new investments to debt funds
+                        - Switch from equity to debt funds (up to ₹{format_indian_currency(retirement_equity - (recommended_equity/100*total_portfolio))})
+                    """)
+                else:
+                    st.success("**Good News**: Your current allocation matches recommendations!")
+                    st.markdown("""
+                    - Continue with your current investment strategy
+                    - Review allocation annually or when your risk profile changes
+                    """)
+                
+                # Additional fund-level recommendations
+                if not retirement_goals.empty:
+                    st.write("#### Fund-Level Recommendations")
                     
-                except Exception as e:
-                    st.error(f"Error loading portfolio: {str(e)}")
-
+                    # Check for over-concentration in any single fund
+                    retirement_goals['pct_of_portfolio'] = (retirement_goals['current_value'] / total_portfolio) * 100
+                    concentrated_funds = retirement_goals[retirement_goals['pct_of_portfolio'] > 20]
+                    
+                    if not concentrated_funds.empty:
+                        st.warning("**Concentration Risk**: The following funds represent >20% of your portfolio:")
+                        st.dataframe(concentrated_funds[['scheme_name', 'investment_type', 'pct_of_portfolio']]
+                                   .assign(pct_of_portfolio=lambda x: x['pct_of_portfolio'].apply(lambda y: f"{y:.1f}%")))
+                        st.markdown("""
+                        **Recommendations**:
+                        - Consider diversifying across more funds
+                        - Reduce contributions to these funds temporarily
+                        - Rebalance by redirecting new investments to other funds
+                        """)
+                    else:
+                        st.success("Your investments are well-diversified across funds")
+                
+            except Exception as e:
+                st.error(f"Error analyzing portfolio: {str(e)}")
+                
 def cashflow_planner_tab():
     st.header("💰 Retirement Cashflow Planner")
     
