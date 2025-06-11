@@ -721,7 +721,21 @@ def get_yearly_investment_summary(monthly_investments):
 # -------------------- STREAMLIT UI --------------------
 def retirement_planner_tab():
     st.header("🏦 Retirement Planner with Progress Tracking")
-    
+    st.markdown("""
+    <style>
+        .milestone-container {
+            width: 100%;
+            overflow-x: auto;
+            white-space: nowrap;
+        }
+        .milestone-line {
+            display: inline-block;
+            min-width: 100%;
+            padding-right: 20px;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
     # Initialize database
     initialize_database()
     
@@ -908,6 +922,16 @@ def retirement_planner_tab():
         else:
              message = "Target crushed! You're a wealth builder!"
         
+        # Get actual investments from user preferences if available
+        user_prefs = load_user_prefs()
+        actual_equity = user_prefs.get('actual_equity', 0)
+        actual_debt = user_prefs.get('actual_debt', 0)
+        has_actuals = actual_equity > 0 or actual_debt > 0
+
+        # Calculate monthly returns
+        monthly_equity_return = (1 + baseline_plan['equity_return']) ** (1/12) - 1
+        monthly_debt_return = (1 + baseline_plan['debt_return']) ** (1/12) - 1
+
         # Next milestone calculation
         next_milestone = None
         milestones = [1.25, 1.5, 2, 3]
@@ -942,20 +966,72 @@ def retirement_planner_tab():
             current_age = baseline_plan['current_age']
             retirement_age = baseline_plan['retirement_age']
             years_remaining = retirement_age - current_age
-            current_growth_rate = (target_total / current_total) ** (1/years_remaining) - 1
 
+            # Scenario 1: Original plan growth rate
+            original_growth_rate = (target_total / current_total) ** (1/years_remaining) - 1
+
+            # Scenario 2: Actual investments growth rate (if available)
+            if has_actuals:
+                # Simulate growth with actual monthly investments
+                def calculate_years_to_milestone(target_amount):
+                    equity_value = current_equity
+                    debt_value = current_debt
+                    months = 0
+
+                    while (equity_value + debt_value) < target_amount:
+                        # Apply monthly returns
+                        equity_value *= (1 + monthly_equity_return)
+                        debt_value *= (1 + monthly_debt_return)
+
+                        # Add new investments (using actual values)
+                        equity_value += actual_equity
+                        debt_value += actual_debt
+
+                        months += 1
+                    return months / 12
+        with st.container():
+            st.markdown("<div class='milestone-container'>", unsafe_allow_html=True)
+
+        # Display milestones with both original and actual projections
             for milestone, label in milestones:
                 milestone_value = target_total * milestone
+
+                # Original plan projection
                 if current_total < milestone_value:
-                    years_needed = int(np.ceil(np.log(milestone_value / current_total) / np.log(1 + current_growth_rate)))
-                    age_at_milestone = current_age + years_needed
-                    st.markdown(f"- {format_indian_currency(milestone_value)} ({label}) by age {age_at_milestone}")
+                    original_years_needed = int(np.ceil(np.log(milestone_value / current_total) / np.log(1 + original_growth_rate)))  # Fixed extra parenthesis
+                    original_age = current_age + original_years_needed
+                    milestone_text = f"- ₹{milestone_value/10000000:.2f} Cr ({label}) by age {original_age} (original plan)"
                 else:
-                    st.markdown(f"- {format_indian_currency(milestone_value)} ({label}) ✅ Achieved!")
-        with col2:
-            st.metric("Current Corpus", format_indian_currency(current_total))
-            st.metric("Target Corpus", format_indian_currency(target_total))
-            st.metric("Remaining", format_indian_currency(max(0, target_total - current_total)))
+                    milestone_text = f"- ₹{milestone_value/10000000:.2f} Cr ({label}) ✅ Achieved (original plan)"
+        
+        # Actual investments projection (if available)
+                if has_actuals and current_total < milestone_value:
+                    actual_years_needed = calculate_years_to_milestone(milestone_value)
+                    actual_age = int(round(current_age + actual_years_needed))  # Round to nearest year
+
+                    if actual_years_needed < original_years_needed:
+                        milestone_text += f" 🚀 EARLY by {original_years_needed-actual_years_needed:.1f} years (actual by age {actual_age})"
+                    elif actual_years_needed > original_years_needed:
+                        milestone_text += f" ⏳ LATE by {actual_years_needed-original_years_needed:.1f} years (actual by age {actual_age})"
+                    else:
+                        milestone_text += f" ⏱ ON TIME (actual by age {actual_age})"
+                elif has_actuals:
+                        milestone_text += " ✅ Achieved (actual)"
+                        
+                st.markdown(f"<div class='milestone-line'>{milestone_text}</div>", unsafe_allow_html=True)
+
+                # Then modify the st.markdown call:
+                st.markdown("</div>", unsafe_allow_html=True)
+        
+    # Add note if actual investments are being used
+            if has_actuals:
+                 st.markdown("")
+                 st.markdown("*Projections based on your actual monthly investments of:*")
+                 st.markdown(f"- Equity: {format_indian_currency(actual_equity * 12)}/year")
+                 st.markdown(f"- Debt: {format_indian_currency(actual_debt * 12)}/year")
+            else:
+                 st.markdown("")
+                 st.markdown("*To see projections based on your actual investments, set them in the Cashflow Planner tab*")
         
         # Show glide path
         st.subheader("📉 Asset Allocation Glide Path")
