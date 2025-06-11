@@ -1178,32 +1178,33 @@ def portfolio_optimizer_tab():
                     st.metric("Debt Allocation", f"{debt_pct:.1f}%", 
                              help="Recommended range: 20-40% based on your age and risk profile")
                 
-                # Calculate XIRR - Improved version
-                with get_db_connection() as conn:
-                    # Get all transactions for retirement funds
-                    query = """
-                        SELECT pd.date, pd.amount 
-                        FROM portfolio_data pd
-                        JOIN goals g ON pd.code = g.scheme_code
-                        WHERE g.goal_name = 'Retirement'
-                        AND pd.transaction_type IN ('invest', 'switch_in')
-                        ORDER BY pd.date
-                    """
-                    cashflows = pd.read_sql(query, conn)
-                
-                if not cashflows.empty:
-                    # Add current portfolio value as negative cashflow (outflow)
-                    final_cashflow = pd.DataFrame({
-                        'date': [datetime.now()],
-                        'amount': [-total_portfolio]
-                    })
-                    cashflows = pd.concat([cashflows, final_cashflow], ignore_index=True)
+                # Function to calculate XIRR
+                def calculate_xirr(investment_type):
+                    with get_db_connection() as conn:
+                        # Get all transactions for specific investment type
+                        query = f"""
+                            SELECT pd.date, pd.amount 
+                            FROM portfolio_data pd
+                            JOIN goals g ON pd.code = g.scheme_code
+                            WHERE g.goal_name = 'Retirement'
+                            AND g.investment_type = '{investment_type}'
+                            AND pd.transaction_type IN ('invest', 'switch_in')
+                            ORDER BY pd.date
+                        """
+                        cashflows = pd.read_sql(query, conn)
                     
-                    # Convert dates to ordinal numbers for calculation
-                    cashflows['date_ordinal'] = cashflows['date'].apply(lambda x: x.toordinal())
-                    
-                    # Function to calculate XIRR
-                    def xirr(cashflows):
+                    if not cashflows.empty:
+                        # Add current portfolio value as negative cashflow (outflow)
+                        current_value = retirement_equity if investment_type == 'Equity' else retirement_debt
+                        final_cashflow = pd.DataFrame({
+                            'date': [datetime.now()],
+                            'amount': [-current_value]
+                        })
+                        cashflows = pd.concat([cashflows, final_cashflow], ignore_index=True)
+                        
+                        # Convert dates to ordinal numbers for calculation
+                        cashflows['date_ordinal'] = cashflows['date'].apply(lambda x: x.toordinal())
+                        
                         try:
                             years = [(d - cashflows['date_ordinal'].iloc[0])/365.0 
                                     for d in cashflows['date_ordinal']]
@@ -1232,15 +1233,40 @@ def portfolio_optimizer_tab():
                             return guess
                         except:
                             return None
-                    
-                    # Calculate and display XIRR
-                    calculated_xirr = xirr(cashflows)
-                    if calculated_xirr is not None:
-                        st.metric("Portfolio XIRR", f"{calculated_xirr*100:.1f}%", 
-                                 help="Annualized return since first investment")
+                    return None
+                
+                # Calculate and display XIRRs
+                st.write("### Portfolio Performance (XIRR)")
+                col1, col2 = st.columns(2)
+                
+                # Equity XIRR
+                equity_xirr = calculate_xirr('Equity')
+                with col1:
+                    if equity_xirr is not None:
+                        st.metric("Equity XIRR", f"{equity_xirr*100:.1f}%", 
+                                 help="Annualized return for equity investments")
                     else:
-                        st.metric("Portfolio XIRR", "N/A", 
-                                 help="Could not calculate XIRR - check your transaction data")
+                        st.metric("Equity XIRR", "N/A", 
+                                 help="Could not calculate XIRR for equity")
+                
+                # Debt XIRR
+                debt_xirr = calculate_xirr('Debt')
+                with col2:
+                    if debt_xirr is not None:
+                        st.metric("Debt XIRR", f"{debt_xirr*100:.1f}%", 
+                                 help="Annualized return for debt investments")
+                    else:
+                        st.metric("Debt XIRR", "N/A", 
+                                 help="Could not calculate XIRR for debt")
+                
+                # Combined Portfolio XIRR
+                combined_xirr = calculate_xirr(None)  # For all retirement investments
+                if combined_xirr is not None:
+                    st.metric("Overall Portfolio XIRR", f"{combined_xirr*100:.1f}%", 
+                             help="Annualized return for entire retirement portfolio")
+                else:
+                    st.metric("Overall Portfolio XIRR", "N/A", 
+                             help="Could not calculate overall portfolio XIRR")
                 
                 # Get all goals
                 goals = get_goal_mappings()
@@ -1252,6 +1278,7 @@ def portfolio_optimizer_tab():
                     st.dataframe(retirement_goals[['investment_type', 'scheme_name', 'current_value']]
                                .assign(current_value=lambda x: x['current_value'].apply(format_indian_currency)))
                 
+                # [Rest of the existing code remains the same...]
                 # Allocation recommendations
                 st.write("### Allocation Recommendations")
                 
