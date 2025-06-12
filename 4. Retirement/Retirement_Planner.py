@@ -12,6 +12,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import json
 import os
+import io
+# Add to your imports if not already present
+import plotly.express as px
+from fpdf import FPDF  # For PDF generation
 
 # -------------------- DATABASE CONFIG --------------------
 DB_PARAMS = {
@@ -230,7 +234,7 @@ def calculate_retirement_corpus(
         return None, None, None, None
     
     years_to_retirement = retirement_age - current_age
-    retirement_years = life_expectancy - retirement_age
+    retirement_years = int(life_expectancy - retirement_age)
     
     # Calculate current annual expenses
     current_annual_expenses = current_monthly_expenses * 12 + recurring_annual_expenses
@@ -1609,7 +1613,443 @@ def cashflow_planner_tab():
         display_df['Debt Investment'] = display_df['Debt Investment'].apply(format_indian_currency)
         display_df['Total Investment'] = display_df['Total Investment'].apply(format_indian_currency)
         st.dataframe(display_df, hide_index=True, use_container_width=True)
+
+import io
+import pandas as pd
+import plotly.express as px
+from datetime import datetime
+
+def bucket_strategy_tab():
+    st.header("🪣 Retirement Bucket Strategy with Custom Projections")
+    
+    # 1. Load Baseline Data
+    existing_plans = get_retirement_plans()
+    has_baseline = not existing_plans.empty and 'BASELINE' in existing_plans['plan_type'].values
+    
+    if not has_baseline:
+        st.warning("No baseline plan found. Create one in Retirement Planner tab first.")
+        st.image("https://i.imgur.com/JtQ8YQg.png", width=300)
+        return
+    
+    baseline_plan = existing_plans[existing_plans['plan_type'] == 'BASELINE'].iloc[0]
+    
+    # 2. Setup Key Variables
+    current_age = baseline_plan['current_age']
+    retirement_age = baseline_plan['retirement_age']
+    life_expectancy = baseline_plan['life_expectancy']
+    retirement_years = int(life_expectancy - retirement_age)
+    corpus_needed = baseline_plan['corpus_needed']
+    current_equity, current_debt = get_retirement_investments()
+    current_corpus = current_equity + current_debt
+    annual_expenses = (baseline_plan['current_monthly_expenses'] * 12 + 
+                     baseline_plan['recurring_annual_expenses'])
+
+    # 3. Add "Retire Today" option
+    st.subheader("🔮 Retire Today Scenario")
+    retire_now = st.checkbox("Show projection if I retire today", value=False)
+
+    if retire_now:
+        # Use current corpus instead of projected corpus_needed
+        corpus_to_use = current_corpus
+        starting_age = current_age
+        years_to_project = int(life_expectancy - current_age)
         
+        st.warning(f"""
+        Projecting retirement starting today (age {current_age}) with:
+        - Current corpus: {format_indian_currency(current_corpus)}
+        - Annual expenses: {format_indian_currency(annual_expenses)}
+        """)
+    else:
+        corpus_to_use = corpus_needed
+        starting_age = retirement_age
+        years_to_project = retirement_years
+
+    # 3. Bucket Configuration UI
+    st.subheader("⚙️ Projection Parameters")
+    
+    with st.expander("Adjust Assumptions", expanded=True):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            b1_return = st.slider("Bucket 1 Return%", 0.0, 10.0, 4.0, step=0.1)/100
+            b2_return = st.slider("Bucket 2 Return%", 0.0, 12.0, 6.0, step=0.1)/100
+        with col2:
+            b3_return = st.slider("Bucket 3 Return%", 0.0, 15.0, 8.0, step=0.1)/100
+            inflation = st.slider("Inflation%", 0.0, 10.0, 5.0, step=0.1)/100
+        with col3:
+            bucket1_pct = st.slider("Bucket 1%", 20, 40, 30)
+            bucket2_pct = st.slider("Bucket 2%", 30, 50, 40)
+            bucket3_pct = 100 - bucket1_pct - bucket2_pct
+            st.metric("Bucket 3%", f"{bucket3_pct}%")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        bucket1_pct = st.slider("0-10 Years %", 20, 40, 30)
+    with col2:
+        bucket2_pct = st.slider("10-20 Years %", 30, 50, 40)
+    with col3:
+        bucket3_pct = 100 - bucket1_pct - bucket2_pct
+        st.metric("20-30 Years %", f"{bucket3_pct}%")
+
+    # 4. Calculate Projections with custom parameters
+    longevity_df = calculate_corpus_longevity(
+        total_corpus=corpus_to_use,
+        annual_spending=annual_expenses,
+        inflation=inflation,
+        b1_pct=bucket1_pct,
+        b2_pct=bucket2_pct,
+        b3_pct=bucket3_pct,
+        years=years_to_project,
+        retire_age=starting_age,
+        b1_return=b1_return,
+        b2_return=b2_return,
+        b3_return=b3_return
+    )
+    
+    # 5. Display Results
+    depletion_row = longevity_df[longevity_df['Total Corpus'] <= 0].iloc[0] if not longevity_df[longevity_df['Total Corpus'] <= 0].empty else longevity_df.iloc[-1]
+    depletion_age = depletion_row['Age']
+    years_funded = depletion_row['Year']
+
+    st.subheader("📊 Custom Projection Results")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Depletion Age", f"Age {int(depletion_age)}")
+        st.metric("Years Funded", f"{int(years_funded)} years")
+    with col2:
+        st.metric("Final Annual Spending", 
+                 format_indian_currency(annual_expenses * (1 + inflation)**years_funded))
+        st.metric("Average Return", 
+                 f"{(b1_return*bucket1_pct + b2_return*bucket2_pct + b3_return*bucket3_pct):.1%}")
+    
+    # 6. Visualization
+    fig = plot_corpus_longevity(longevity_df, depletion_age)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Extend projection to at least depletion age (minimum 10 years beyond retirement)
+    extended_years = max(10, years_funded + 5)  # Show at least 5 years past depletion
+    if len(longevity_df) < extended_years:
+        longevity_df = calculate_corpus_longevity(
+            corpus_needed,
+            annual_expenses,
+            inflation,
+            bucket1_pct,
+            bucket2_pct,
+            bucket3_pct,
+            extended_years,
+            retirement_age
+        )
+
+    # 5. Display Results
+    st.subheader("📈 Corpus Longevity Projection")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Projected Depletion Age", f"Age {depletion_age}")
+    with col2:
+        st.metric("Years Funded", f"{years_funded} years")
+
+    # 6. Visualization
+    fig = plot_corpus_longevity(longevity_df, depletion_age)
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # 7. Improvement Tips
+    show_improvement_tips(current_equity, current_debt, bucket1_pct, bucket3_pct, current_age)
+    
+    # 8. Stress Testing
+    with st.expander("🧪 Stress Test Scenarios", expanded=False):
+        run_stress_tests(
+            longevity_df.copy(), 
+            annual_expenses,
+            inflation,  # This is the user-adjusted inflation from the slider
+            b1_return,  # Pass the bucket returns too
+            b2_return,
+            b3_return
+        )
+
+    # 9. Export Options
+    st.download_button(
+        label="📄 Download Projection Report",
+        data=generate_report(longevity_df, bucket1_pct, bucket2_pct, bucket3_pct),
+        file_name="bucket_strategy_report.csv",
+        mime="text/csv"
+    )
+
+def calculate_corpus_longevity(total_corpus, annual_spending, inflation, 
+                             b1_pct, b2_pct, b3_pct, years, retire_age,
+                             b1_return=0.04, b2_return=0.06, b3_return=0.08):
+    projection = []
+    remaining_corpus = total_corpus
+    
+    # Convert bucket percentages to actual amounts
+    bucket1_amount = total_corpus * (b1_pct/100)
+    bucket2_amount = total_corpus * (b2_pct/100)
+    bucket3_amount = total_corpus * (b3_pct/100)
+    
+    for year in range(1, int(years) + 1):
+        current_age = retire_age + year
+        yearly_spending = annual_spending * (1 + inflation) ** (year - 1)
+        
+        # Withdraw from buckets in order (1 → 2 → 3)
+        withdrawn = 0
+        remaining_withdrawal = yearly_spending
+        
+        # Bucket 1 (Cash/Liquid)
+        if bucket1_amount > 0:
+            bucket1_amount *= (1 + b1_return)  # Apply custom return
+            withdraw_from_b1 = min(bucket1_amount, remaining_withdrawal)
+            bucket1_amount -= withdraw_from_b1
+            remaining_withdrawal -= withdraw_from_b1
+            withdrawn += withdraw_from_b1
+        
+        # Bucket 2 (Income)
+        if remaining_withdrawal > 0 and bucket2_amount > 0:
+            bucket2_amount *= (1 + b2_return)
+            withdraw_from_b2 = min(bucket2_amount, remaining_withdrawal)
+            bucket2_amount -= withdraw_from_b2
+            remaining_withdrawal -= withdraw_from_b2
+            withdrawn += withdraw_from_b2
+        
+        # Bucket 3 (Growth)
+        if remaining_withdrawal > 0 and bucket3_amount > 0:
+            bucket3_amount *= (1 + b3_return)
+            withdraw_from_b3 = min(bucket3_amount, remaining_withdrawal)
+            bucket3_amount -= withdraw_from_b3
+            remaining_withdrawal -= withdraw_from_b3
+            withdrawn += withdraw_from_b3
+        
+        # Calculate total remaining corpus
+        remaining_corpus = bucket1_amount + bucket2_amount + bucket3_amount
+        
+        projection.append({
+            "Year": year,
+            "Age": current_age,
+            "Bucket1": bucket1_amount,
+            "Bucket2": bucket2_amount,
+            "Bucket3": bucket3_amount,
+            "Total Corpus": remaining_corpus,
+            "Withdrawal": yearly_spending,
+            "Actual Withdrawn": withdrawn,
+            "Shortfall": max(0, yearly_spending - withdrawn),
+            "Return Rate": f"{(b1_return*b1_pct + b2_return*b2_pct + b3_return*b3_pct)/100:.1%}"
+        })
+        
+        if remaining_corpus <= 0:
+            break
+    
+    return pd.DataFrame(projection)
+
+def plot_corpus_longevity(df, depletion_age=None):
+    fig = go.Figure()
+    
+    # FIX: Using the correct bucket column names
+    buckets = {
+        'Bucket1': {'name': '0-10 Years (Cash)', 'color': '#636EFA'},
+        'Bucket2': {'name': '10-20 Years (Income)', 'color': '#EF553B'}, 
+        'Bucket3': {'name': '20+ Years (Growth)', 'color': '#00CC96'}
+    }
+    
+    for bucket, style in buckets.items():
+        fig.add_trace(go.Scatter(
+            x=df['Age'],
+            y=df[bucket],
+            name=style['name'],
+            stackgroup='one',
+            line=dict(width=0.5, color=style['color']),
+            fillcolor=style['color'],
+            hovertemplate="Age: %{x}<br>Value: ₹%{y:,.0f}<br>Bucket: "+style['name'],
+            fill='tonexty'
+        ))
+    
+    # FIX: Using 'Total Corpus' instead of 'Corpus'
+    fig.add_trace(go.Scatter(
+        x=df['Age'],
+        y=df['Total Corpus'],
+        name='Total Portfolio',
+        line=dict(color='#2A3F54', width=3),
+        hovertemplate="Age: %{x}<br>Total: ₹%{y:,.0f}"
+    ))
+    
+    # Add withdrawal line
+    fig.add_trace(go.Scatter(
+        x=df['Age'],
+        y=df['Withdrawal'],
+        name='Annual Spending',
+        line=dict(color='red', width=2, dash='dot'),
+        hovertemplate="Age: %{x}<br>Spending: ₹%{y:,.0f}"
+    ))
+    
+    # Add depletion marker (using either provided depletion_age or calculated)
+    final_depletion_age = depletion_age if depletion_age else df[df['Total Corpus'] <= 0]['Age'].min()
+    if not pd.isna(final_depletion_age):
+        fig.add_vline(
+            x=final_depletion_age,
+            line=dict(color='black', width=2, dash='dash'),
+            annotation_text=f"Depletion at age {int(final_depletion_age)}",
+            annotation_position="top right",
+            annotation_font_size=12,
+            annotation_font_color="red"
+        )
+    
+    # Add shortfall markers if any
+    if 'Shortfall' in df.columns and (df['Shortfall'] > 0).any():
+        shortfall_years = df[df['Shortfall'] > 0]
+        fig.add_trace(go.Scatter(
+            x=shortfall_years['Age'],
+            y=shortfall_years['Withdrawal'],
+            mode='markers',
+            marker=dict(color='red', size=8, symbol='x'),
+            name='Withdrawal Shortfall',
+            hovertemplate="Age: %{x}<br>Shortfall: ₹%{y:,.0f}"
+        ))
+    
+    fig.update_layout(
+        title="Retirement Bucket Strategy Projection",
+        xaxis_title="Age",
+        yaxis_title="Amount (₹)",
+        hovermode="x unified",
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        yaxis=dict(tickprefix="₹", gridcolor='lightgray'),
+        xaxis=dict(gridcolor='lightgray'),
+        plot_bgcolor='white'
+    )
+    
+    return fig
+
+def show_improvement_tips(current_equity, current_debt, b1_pct, b3_pct, current_age):
+    with st.expander("💡 How to Improve Portfolio Longevity", expanded=True):
+        st.markdown(f"""
+        **1. Dynamic Withdrawals**  
+        → Reduce spending by 10% when portfolio drops 15%  
+        → Example: ₹12L → ₹10.8L in bad years (+3-5 years)  
+
+        **2. Tax Optimization**  
+        → Roth conversions when income < ₹7L taxable  
+        → Harvest losses to offset capital gains  
+
+        **3. Growth Boost**  
+        → Current growth allocation: **{b3_pct}%**  
+        → Ideal range: 30-50% for age {current_age}  
+        → Consider increasing by {max(0, 40-b3_pct)}%  
+
+        **4. Annuity Ladder**  
+        → Use 10-20% of Bucket 1 to buy deferred annuities  
+        → Guarantees income from age 75+  
+
+        **5. Expense Flooring**  
+        → Cover basics with SWP from debt funds (₹X/month)  
+        → Keep discretionary spending flexible  
+        """)
+
+def run_stress_tests(base_df, annual_spending, base_inflation, b1_return, b2_return, b3_return):
+    col1, col2 = st.columns(2)
+    with col1:
+        crash_test = st.checkbox("Simulate Market Crash (First 5 Years)", value=False)
+        crash_severity = st.slider("Crash Severity (%)", 10, 50, 30, disabled=not crash_test)/100
+    
+    with col2:
+        inflation_test = st.checkbox("Simulate High Inflation", value=False)
+        stress_inflation = st.slider("Stress Inflation (%)", 
+                                   max(1.0, base_inflation*100), 15.0, 7.0, 
+                                   disabled=not inflation_test)/100
+    
+    if crash_test or inflation_test:
+        test_df = base_df.copy()
+        
+        # Apply stress scenarios
+        for i, row in test_df.iterrows():
+            # Market crash impact
+            if crash_test and row['Year'] <= 5:
+                for bucket in ['Bucket1', 'Bucket2', 'Bucket3']:
+                    test_df.at[i, bucket] *= (1 - crash_severity)  # Apply crash impact
+            
+            # Inflation impact - use either base or stress inflation
+            current_inflation = stress_inflation if inflation_test else base_inflation
+            test_df.at[i, 'Withdrawal'] = annual_spending * (1 + current_inflation) ** (row['Year'] - 1)
+        
+        # Recalculate with proper depletion logic
+        for i in range(1, len(test_df)):
+            # Apply returns to each bucket first
+            test_df.at[i, 'Bucket1'] = test_df.at[i-1, 'Bucket1'] * (1 + b1_return)
+            test_df.at[i, 'Bucket2'] = test_df.at[i-1, 'Bucket2'] * (1 + b2_return)
+            test_df.at[i, 'Bucket3'] = test_df.at[i-1, 'Bucket3'] * (1 + b3_return)
+            
+            # Withdraw from buckets in order
+            remaining_withdrawal = test_df.at[i, 'Withdrawal']
+            for bucket in ['Bucket1', 'Bucket2', 'Bucket3']:
+                if remaining_withdrawal > 0 and test_df.at[i, bucket] > 0:
+                    withdraw_amount = min(test_df.at[i, bucket], remaining_withdrawal)
+                    test_df.at[i, bucket] -= withdraw_amount
+                    remaining_withdrawal -= withdraw_amount
+            
+            # Update total and track shortfalls
+            test_df.at[i, 'Total Corpus'] = test_df.at[i, 'Bucket1'] + test_df.at[i, 'Bucket2'] + test_df.at[i, 'Bucket3']
+            test_df.at[i, 'Shortfall'] = max(0, remaining_withdrawal)
+            
+            if test_df.at[i, 'Total Corpus'] <= 0:
+                break
+        
+        # Visualize results
+        depletion_age = test_df[test_df['Total Corpus'] <= 0]['Age'].min()
+        fig = plot_corpus_longevity(test_df, depletion_age)
+        
+        st.warning(f"""
+        Stress Test Results:
+        - Projected depletion age: {int(depletion_age) if not pd.isna(depletion_age) else 'Never'}
+        - Worst annual shortfall: {format_indian_currency(test_df['Shortfall'].max())}
+        """)
+        st.plotly_chart(fig, use_container_width=True)
+
+def generate_report(df, b1, b2, b3):
+    output = io.StringIO()
+    df.to_csv(output, index=False)
+    return output.getvalue()
+
+def format_indian_currency(amount):
+    if pd.isna(amount) or amount == 0:
+        return "₹0"
+    
+    amount = float(amount)
+    if amount < 100000:
+        return f"₹{amount:,.0f}"
+    elif amount < 10000000:
+        lakhs = amount / 100000
+        return f"₹{lakhs:,.2f} L"
+    else:
+        crores = amount / 10000000
+        return f"₹{crores:,.2f} Cr"
+
+def get_retirement_plans():
+    with get_db_connection() as conn:
+        return pd.read_sql("SELECT * FROM retirement_plans ORDER BY created_date DESC", conn)
+
+def get_retirement_investments():
+    with get_db_connection() as conn:
+        # Get equity investments for retirement
+        equity_query = """
+        SELECT COALESCE(SUM(pd.units * mf.value), 0) as equity_value
+        FROM portfolio_data pd
+        JOIN mutual_fund_nav mf ON pd.code = mf.code
+        JOIN goals g ON pd.code = g.scheme_code
+        WHERE g.goal_name = 'Retirement'
+        AND g.investment_type = 'Equity'
+        AND mf.nav = (SELECT MAX(nav) FROM mutual_fund_nav WHERE code = pd.code)
+        AND pd.transaction_type IN ('invest', 'switch_in')
+        """
+        equity_value = pd.read_sql(equity_query, conn).iloc[0,0]
+        
+        # Get debt investments for retirement
+        debt_query = """
+        SELECT COALESCE(SUM(current_value), 0) as debt_value
+        FROM goals
+        WHERE goal_name = 'Retirement'
+        AND investment_type = 'Debt'
+        """
+        debt_value = pd.read_sql(debt_query, conn).iloc[0,0]
+        
+        return equity_value, debt_value
+
+def get_db_connection():
+    return psycopg.connect(**DB_PARAMS)     
 # -------------------- MAIN APP --------------------
 def main():
     st.set_page_config(
@@ -1645,7 +2085,7 @@ def main():
     """, unsafe_allow_html=True)
     
     # Create tabs
-    tab1, tab2, tab3 = st.tabs(["🏦 Retirement Planner", "💰 Cashflow Planner", "📊 Portfolio Optimizer"])
+    tab1, tab2, tab3,tab4 = st.tabs(["🏦 Retirement Planner", "💰 Cashflow Planner", "📊 Portfolio Optimizer","🪣 Bucket Strategy"])
     
     with tab1:
         retirement_planner_tab()
@@ -1655,6 +2095,8 @@ def main():
     
     with tab3:
         portfolio_optimizer_tab()
+    with tab4:  # New tab
+        bucket_strategy_tab()  # New function
 
 if __name__ == "__main__":
     main()
