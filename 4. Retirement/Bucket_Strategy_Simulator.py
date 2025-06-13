@@ -79,6 +79,7 @@ refill_from_b3 = []
 shortfalls = []
 refill_events = []
 equity_allocation_history = []
+sankey_flows = []  # To track bucket transfers for Sankey diagram
 
 def get_glidepath_allocation(current_age):
     """Calculate equity allocation based on age"""
@@ -91,7 +92,7 @@ def get_glidepath_allocation(current_age):
 
 def run_simulation():
     global bucket1, bucket2, bucket3, years, values, bucket1_vals, bucket2_vals, bucket3_vals
-    global refill_from_b2, refill_from_b3, shortfalls, refill_events, equity_allocation_history
+    global refill_from_b2, refill_from_b3, shortfalls, refill_events, equity_allocation_history, sankey_flows
     
     # Reset trackers
     years = []
@@ -104,6 +105,7 @@ def run_simulation():
     shortfalls = []
     refill_events = []
     equity_allocation_history = []
+    sankey_flows = []
     
     current_age = age
     corpus_depleted = False
@@ -161,6 +163,12 @@ def run_simulation():
                             bucket2 -= transfer
                             bucket1 += transfer
                             refill_events.append(f"Year {yr+1}: Refilled B1 with ₹{transfer:,.0f} from B2 (Partial top-up)")
+                            sankey_flows.append({
+                                "source": "Bucket 2",
+                                "target": "Bucket 1",
+                                "value": transfer,
+                                "year": current_age
+                            })
                             needed -= transfer
                         
                         # Then try from Bucket 3 if still needed
@@ -169,6 +177,12 @@ def run_simulation():
                             bucket3 -= transfer
                             bucket1 += transfer
                             refill_events.append(f"Year {yr+1}: Refilled B1 with ₹{transfer:,.0f} from B3 (Emergency top-up)")
+                            sankey_flows.append({
+                                "source": "Bucket 3",
+                                "target": "Bucket 1",
+                                "value": transfer,
+                                "year": current_age
+                            })
 
         # Grow buckets
         if bucket1 > 0:
@@ -228,7 +242,8 @@ def run_simulation():
         "cutoff_year": cutoff_year,
         "cutoff_expense": cutoff_expense,
         "cutoff_growth": cutoff_growth,
-        "final_age": current_age if corpus_depleted else 90
+        "final_age": current_age if corpus_depleted else 90,
+        "sankey_flows": sankey_flows
     }
 
 # Run simulation when Analyze button is clicked
@@ -236,7 +251,7 @@ if st.sidebar.button("🚀 Analyze Strategy"):
     with st.spinner("Running simulation..."):
         results = run_simulation()
         
-        # Plot
+        # Main plot
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=years, y=bucket1_vals, name="Bucket 1 (Debt)", line=dict(color="orange")))
         fig.add_trace(go.Scatter(x=years, y=bucket2_vals, name="Bucket 2 (Balanced)", line=dict(color="blue")))
@@ -253,6 +268,45 @@ if st.sidebar.button("🚀 Analyze Strategy"):
 
         fig.update_layout(title="Corpus and Bucket Value Over Time", xaxis_title="Age", yaxis_title="Value (₹)", height=600)
         st.plotly_chart(fig, use_container_width=True)
+
+        # Sankey Diagram
+        if results["sankey_flows"]:
+            st.subheader("🔄 Bucket Transfer Flows (Sankey Diagram)")
+            
+            # Prepare Sankey data
+            sources = []
+            targets = []
+            values = []
+            labels = ["Bucket 1", "Bucket 2", "Bucket 3"]
+            
+            for flow in results["sankey_flows"]:
+                sources.append(labels.index(flow["source"]))
+                targets.append(labels.index(flow["target"]))
+                values.append(flow["value"] / 100000)  # Scale down for readability
+            
+            fig_sankey = go.Figure(go.Sankey(
+                node=dict(
+                    pad=15,
+                    thickness=20,
+                    line=dict(color="black", width=0.5),
+                    label=labels,
+                    color=["orange", "blue", "green"]
+                ),
+                link=dict(
+                    source=sources,
+                    target=targets,
+                    value=values,
+                    hoverinfo="all",
+                    hovertemplate="%{source.label} → %{target.label}<br>Amount: ₹%{value:.1f}L<extra></extra>"
+                )
+            ))
+            
+            fig_sankey.update_layout(
+                title_text="Fund Transfers Between Buckets",
+                font_size=10,
+                height=400
+            )
+            st.plotly_chart(fig_sankey, use_container_width=True)
 
         # Display depletion info
         if results["corpus_depleted"]:
