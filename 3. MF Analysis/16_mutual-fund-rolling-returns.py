@@ -5,6 +5,8 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import psycopg
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 def connect_to_db():
     """Create database connection"""
@@ -86,7 +88,7 @@ def calculate_benchmark_rolling_returns(df, period_years):
     return rolling_cagr.dropna()
 
 def plot_rolling_returns(fund_data, benchmark_data, period_name, period_years, scheme_name):
-    """Plot rolling returns for a given period"""
+    """Plot rolling returns for a given period using Plotly"""
     # Calculate rolling returns for the fund
     fund_rolling_cagr = calculate_rolling_returns(
         fund_data.rename(columns={'nav': 'date', 'value': 'value'}),
@@ -98,16 +100,94 @@ def plot_rolling_returns(fund_data, benchmark_data, period_name, period_years, s
         period_years
     )
 
-    # Plot rolling returns
-    plt.figure(figsize=(10, 4))
-    plt.plot(fund_rolling_cagr.index, fund_rolling_cagr * 100, label=f'{scheme_name} Rolling CAGR', color='blue')
-    plt.plot(benchmark_rolling_cagr.index, benchmark_rolling_cagr * 100, label='Benchmark Rolling CAGR', color='orange')
-    plt.xlabel('Start Date of Rolling Period')
-    plt.ylabel('CAGR (%)')
-    plt.title(f'{period_name} Rolling Returns: {scheme_name} vs Benchmark')
-    plt.legend()
-    plt.grid(True)
-    st.pyplot(plt)
+    # Create Plotly figure
+    fig = go.Figure()
+    
+    # Add fund trace with a distinct color (blue)
+    fig.add_trace(go.Scatter(
+        x=fund_rolling_cagr.index,
+        y=fund_rolling_cagr * 100,
+        name=f'{scheme_name} Rolling CAGR',
+        line=dict(color='#1f77b4', width=2),  # Blue color
+        mode='lines'
+    ))
+    
+    # Add benchmark trace with a contrasting color (orange)
+    fig.add_trace(go.Scatter(
+        x=benchmark_rolling_cagr.index,
+        y=benchmark_rolling_cagr * 100,
+        name='Benchmark Rolling CAGR',
+        line=dict(color='#ff7f0e', width=2),  # Orange color
+        mode='lines'
+    ))
+    
+    # Update layout
+    fig.update_layout(
+        title=f'{period_name} Rolling Returns: {scheme_name} vs Benchmark',
+        xaxis_title='Start Date of Rolling Period',
+        yaxis_title='CAGR (%)',
+        hovermode='x unified',
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=500,
+        template='plotly_white'
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+def plot_multiple_funds_rolling_returns(fund_data_list, benchmark_data, period_name, period_years):
+    """Plot rolling returns for multiple funds vs benchmark using Plotly"""
+    # Create Plotly figure
+    fig = go.Figure()
+    
+    # Define a color palette with distinct colors
+    colors = [
+        '#1f77b4',  # Blue
+        '#2ca02c',  # Green
+        '#d62728',  # Red
+        '#9467bd',  # Purple
+        '#8c564b',  # Brown
+        '#e377c2',  # Pink
+        '#7f7f7f',  # Gray
+        '#bcbd22',  # Olive
+        '#17becf'   # Teal
+    ]
+    
+    # Add benchmark trace first (orange)
+    benchmark_rolling_cagr = calculate_benchmark_rolling_returns(benchmark_data, period_years)
+    fig.add_trace(go.Scatter(
+        x=benchmark_rolling_cagr.index,
+        y=benchmark_rolling_cagr * 100,
+        name='Benchmark Rolling CAGR',
+        line=dict(color='#ff7f0e', width=2),  # Orange color
+        mode='lines'
+    ))
+    
+    # Add traces for each fund with distinct colors
+    for idx, (fund_data, fund_name) in enumerate(fund_data_list):
+        fund_rolling_cagr = calculate_rolling_returns(
+            fund_data.rename(columns={'nav': 'date', 'value': 'value'}),
+            period_years
+        )
+        fig.add_trace(go.Scatter(
+            x=fund_rolling_cagr.index,
+            y=fund_rolling_cagr * 100,
+            name=f'{fund_name} Rolling CAGR',
+            line=dict(color=colors[idx % len(colors)], width=2),
+            mode='lines'
+        ))
+    
+    # Update layout
+    fig.update_layout(
+        title=f'{period_name} Rolling Returns: Funds vs Benchmark',
+        xaxis_title='Start Date of Rolling Period',
+        yaxis_title='CAGR (%)',
+        hovermode='x unified',
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=500,
+        template='plotly_white'
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
 
 def main():
     st.set_page_config(page_title='Mutual Fund Rolling Returns Analyzer', layout='wide')
@@ -197,25 +277,7 @@ def main():
 
                 # Calculate and plot rolling returns for each period
                 for period_name, period_years in periods.items():
-                    plt.figure(figsize=(10, 4))
-                    # Plot benchmark rolling returns
-                    benchmark_rolling_cagr = calculate_benchmark_rolling_returns(benchmark_data, period_years)
-                    plt.plot(benchmark_rolling_cagr.index, benchmark_rolling_cagr * 100, label='Benchmark Rolling CAGR', color='orange')
-
-                    # Plot rolling returns for each fund
-                    for fund_data, fund_name in fund_data_list:
-                        fund_rolling_cagr = calculate_rolling_returns(
-                            fund_data.rename(columns={'nav': 'date', 'value': 'value'}),
-                            period_years
-                        )
-                        plt.plot(fund_rolling_cagr.index, fund_rolling_cagr * 100, label=f'{fund_name} Rolling CAGR')
-
-                    plt.xlabel('Start Date of Rolling Period')
-                    plt.ylabel('CAGR (%)')
-                    plt.title(f'{period_name} Rolling Returns: Funds vs Benchmark')
-                    plt.legend()
-                    plt.grid(True)
-                    st.pyplot(plt)
+                    plot_multiple_funds_rolling_returns(fund_data_list, benchmark_data, period_name, period_years)
 
 if __name__ == "__main__":
     main()
