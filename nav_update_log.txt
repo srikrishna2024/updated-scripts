@@ -1,2 +1,9 @@
-[2025-06-20 10:21:20] Invalid choice made by user.
-[2025-06-20 10:21:20] NAV update completed.
+[2025-06-21 15:09:37] Updated 0 records for scheme: ICICI Prudential Large & Mid Cap Fund - Direct Plan - Growth (Code: 120596)
+[2025-06-21 15:09:38] Updated 0 records for scheme: Nippon India Growth Fund - Direct Plan Growth Plan - Growth Option (Code: 118668)
+[2025-06-21 15:09:38] Updated 0 records for scheme: ICICI Prudential Equity & Debt Fund - Direct Plan - Growth (Code: 120251)
+[2025-06-21 15:09:39] Updated 0 records for scheme: Parag Parikh Liquid Fund- Direct Plan- Growth (Code: 143269)
+[2025-06-21 15:09:39] Updated 1 records for scheme: Parag Parikh Flexi Cap Fund - Direct Plan - Growth (Code: 122639)
+[2025-06-21 15:09:40] Updated 0 records for scheme: ICICI Prudential Money Market Fund Option - Direct Plan -  Growth (Code: 120211)
+[2025-06-21 15:09:40] Updated 0 records for scheme: Nippon India Large Cap Fund - Direct Plan Growth Plan - Growth Option (Code: 118632)
+[2025-06-21 15:09:40] Total NAV records updated: 1
+[2025-06-21 15:09:40] NAV update completed.

@@ -152,7 +152,7 @@ def insert_goal_mapping(goal_name, investment_type, scheme_name, scheme_code, cu
                     RETURNING id
                 """, (goal_name, investment_type, scheme_name, scheme_code, current_value, is_manual_entry))
                 
-                inserted_id = cur.fetchone()[0]
+                cur.fetchone()
                 conn.commit()
                 return True
     except Exception as e:
@@ -531,31 +531,72 @@ def main():
             st.dataframe(styled_df, use_container_width=True)
             
             st.subheader("Portfolio Allocation")
-            holdings_sorted = holdings.sort_values('current_value', ascending=True)
-            fig = px.bar(
-                holdings_sorted,
-                x='current_value',
-                y='scheme_name',
-                orientation='h',
-                title='Portfolio Allocation by Current Value',
-                color='scheme_name',
-                color_discrete_sequence=px.colors.qualitative.Set3,
-                text='current_value'
+            # Get all required data in a single connection block
+            try:
+                with get_db_connection() as conn:
+                    # Get portfolio holdings
+                    holdings = get_portfolio_holdings()
+
+                    # Get investment types from goals table
+                    investment_types = pd.read_sql("""
+                        SELECT DISTINCT scheme_code, investment_type 
+                        FROM goals
+                        WHERE investment_type IN ('Equity', 'Debt')
+                    """, conn)
+            
+                    # Get scheme categories from mutual_fund_master_data
+                    scheme_categories = pd.read_sql("""
+                        SELECT code, scheme_category, scheme_type
+                        FROM mutual_fund_master_data
+                    """, conn)
+
+                # Merge with holdings data
+                holdings = holdings.merge(
+                     investment_types,
+                    left_on='code',
+                    right_on='scheme_code',
+                    how='left'
+                ).merge(
+                    scheme_categories,
+                    left_on='code',
+                    right_on='code',
+                    how='left'
+                )
+            except Exception as e:
+                st.error(f"Error loading portfolio allocation data: {e}")
+                holdings['scheme_category'] = 'Other'
+                holdings['scheme_type'] = 'Other'
+
+            # Fill any missing categories with 'Other'
+            holdings['scheme_category'] = holdings['scheme_category'].fillna('Other')
+            holdings['scheme_type'] = holdings['scheme_type'].fillna('Other')
+            
+            # Create sunburst visualization
+            fig = px.sunburst(
+                holdings,
+                path=['investment_type', 'scheme_category', 'scheme_name'],
+                values='current_value',
+                color='investment_type',
+                color_discrete_map={
+                    'Equity': '#1f77b4',
+                    'Debt': '#ff7f0e',
+                    'Other': '#2ca02c'
+                },
+                title='Portfolio Allocation by Investment Type and Category',
+                hover_data=['current_value']
             )
+            
             fig.update_traces(
-                texttemplate='₹%{text:,.2f}',
-                textposition='outside'
+                textinfo="label+percent parent",
+                texttemplate="%{label}<br>₹%{value:,.2f}",
+                hovertemplate="<b>%{label}</b><br>Value: ₹%{value:,.2f}<extra></extra>"
             )
+            
             fig.update_layout(
-                showlegend=False,
-                yaxis_title="Scheme",
-                xaxis_title="Current Value (₹)",
-                height=600,
-                margin=dict(l=100, r=50, t=50, b=50)
+                margin=dict(t=40, l=0, r=0, b=0),
+                height=600
             )
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No holdings found. Add transactions to see your portfolio.")
         
         st.subheader("Transaction History")
         transactions = get_transaction_history()
