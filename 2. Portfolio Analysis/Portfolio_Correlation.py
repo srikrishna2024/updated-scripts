@@ -110,7 +110,7 @@ def analyze_correlation_patterns(corr_matrix):
     Analyze correlation patterns and provide recommendations
     Returns a dictionary with analysis results
     """
-    # Get upper triangle without diagonal (k=1) - FIXED: Convert to boolean array
+    # Get upper triangle without diagonal (k=1)
     upper_triangle_mask = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
     upper_triangle = corr_matrix.where(upper_triangle_mask)
     upper_triangle_values = upper_triangle.values[np.triu_indices_from(corr_matrix, k=1)]
@@ -151,6 +151,43 @@ def analyze_correlation_patterns(corr_matrix):
     
     return analysis
 
+def get_portfolio_weights():
+    """Get current portfolio weights for each fund"""
+    with connect_to_db() as conn:
+        query = """
+            SELECT code, SUM(value) as total_value
+            FROM portfolio_data
+            WHERE transaction_type IN ('invest', 'switch_in')
+            GROUP BY code
+        """
+        weights = pd.read_sql(query, conn)
+        weights['weight'] = weights['total_value'] / weights['total_value'].sum()
+        return weights[['code', 'weight']]
+
+def calculate_diversification_score(corr_matrix, weights):
+    """
+    Calculate portfolio diversification score
+    Formula: 1 - (weighted average correlation)
+    Higher score = better diversification (0-1 scale)
+    """
+    # Create weights matrix for pairwise products
+    weights_matrix = np.outer(weights, weights)
+    
+    # Mask upper triangle (excluding diagonal)
+    mask = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+    weighted_correlations = corr_matrix.values * weights_matrix * mask
+    
+    # Calculate weighted average correlation
+    sum_weights = weights_matrix[mask].sum()
+    if sum_weights > 0:
+        weighted_avg_corr = weighted_correlations.sum() / sum_weights
+    else:
+        weighted_avg_corr = 0
+    
+    diversification_score = 1 - weighted_avg_corr
+    
+    return diversification_score, weighted_avg_corr
+
 def calculate_risk_contributions(corr_matrix, returns_data, portfolio_funds):
     """
     Calculate risk contributions for each fund before and after diversification
@@ -163,11 +200,24 @@ def calculate_risk_contributions(corr_matrix, returns_data, portfolio_funds):
     # Create covariance matrix
     cov_matrix = returns_data.cov()
     
-    # Assume equal weights for simplicity (can be modified to use actual portfolio weights)
-    weights = np.ones(len(fund_codes)) / len(fund_codes)
+    # Get portfolio weights (or assume equal weights if not available)
+    try:
+        weights_df = get_portfolio_weights()
+        weights = weights_df.set_index('code').reindex(fund_codes)['weight'].values
+        weights = np.nan_to_num(weights, nan=1/len(fund_codes))  # Replace NaN with equal weights
+        weights = weights / weights.sum()  # Ensure weights sum to 1
+    except:
+        weights = np.ones(len(fund_codes)) / len(fund_codes)
     
-    # Calculate portfolio variance
+    # Calculate portfolio variance and volatility
     portfolio_variance = np.dot(weights.T, np.dot(cov_matrix, weights))
+    portfolio_volatility = np.sqrt(portfolio_variance)
+    
+    # Calculate Marginal Risk Contributions (MRC)
+    mrc = np.dot(cov_matrix, weights) / portfolio_volatility
+    
+    # Calculate % Risk Contribution (RC%)
+    rc_pct = (weights * mrc) / portfolio_volatility * 100
     
     # Calculate marginal/undiversified risk contribution (individual variance)
     marginal_risk = weights * volatilities**2
@@ -180,6 +230,13 @@ def calculate_risk_contributions(corr_matrix, returns_data, portfolio_funds):
     # Calculate diversification benefit (reduction in risk contribution)
     diversification_benefit = marginal_risk_pct - diversified_risk_pct
     
+    # Calculate risk-weight ratio (RWR)
+    portfolio_weights_pct = weights * 100
+    risk_weight_ratio = diversified_risk_pct / portfolio_weights_pct
+    
+    # Calculate diversification score
+    diversification_score, weighted_avg_corr = calculate_diversification_score(corr_matrix, weights)
+    
     # Create DataFrame with results
     risk_data = []
     for i, code in enumerate(fund_codes):
@@ -187,13 +244,24 @@ def calculate_risk_contributions(corr_matrix, returns_data, portfolio_funds):
         risk_data.append({
             'Fund Code': code,
             'Fund Name': fund_name,
+            'Portfolio Weight (%)': portfolio_weights_pct[i],
             'Volatility': volatilities[i],
+            'Marginal Risk Contribution (MRC)': mrc[i],
+            '% Risk Contribution (RC%)': rc_pct[i],
             'Marginal Risk Contribution (%)': marginal_risk_pct[i],
             'Diversified Risk Contribution (%)': diversified_risk_pct[i],
-            'Diversification Benefit (%)': diversification_benefit[i]
+            'Diversification Benefit (%)': diversification_benefit[i],
+            'Risk-Weight Ratio (RWR)': risk_weight_ratio[i]
         })
     
-    return pd.DataFrame(risk_data).sort_values('Diversified Risk Contribution (%)', ascending=False)
+    risk_df = pd.DataFrame(risk_data).sort_values('% Risk Contribution (RC%)', ascending=False)
+    
+    # Add portfolio-level metrics to the risk_df attributes
+    risk_df.attrs['diversification_score'] = diversification_score
+    risk_df.attrs['weighted_avg_correlation'] = weighted_avg_corr
+    risk_df.attrs['portfolio_volatility'] = portfolio_volatility
+    
+    return risk_df
 
 def plot_risk_contributions(risk_df):
     """
@@ -262,6 +330,66 @@ def plot_risk_contributions(risk_df):
     
     return fig
 
+def plot_risk_weight_ratio(risk_df):
+    """
+    Create a bar chart showing Risk-Weight Ratio (RWR) for each fund
+    """
+    # Sort by RWR
+    risk_df = risk_df.sort_values('Risk-Weight Ratio (RWR)', ascending=False)
+    
+    # Create color scale based on RWR values
+    colors = ['#EF553B' if rwr > 1.2 else '#00CC96' if rwr < 0.8 else '#636EFA' 
+              for rwr in risk_df['Risk-Weight Ratio (RWR)']]
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Bar(
+        x=risk_df['Fund Name'],
+        y=risk_df['Risk-Weight Ratio (RWR)'],
+        marker_color=colors,
+        hovertemplate='<b>%{x}</b><br>' +
+                      'RWR: %{y:.2f}<br>' +
+                      'Weight: %{customdata[0]:.1f}%<br>' +
+                      'Risk Contribution: %{customdata[1]:.1f}%<br>' +
+                      '<extra></extra>',
+        customdata=np.stack((risk_df['Portfolio Weight (%)'], 
+                            risk_df['Diversified Risk Contribution (%)']), axis=-1)
+    ))
+    
+    # Add reference lines without annotations (we'll add them separately)
+    fig.add_hline(y=1, line_dash="dash", line_color="gray")
+    fig.add_hline(y=1.2, line_dash="dot", line_color="red")
+    fig.add_hline(y=0.8, line_dash="dot", line_color="green")
+    
+    # Create custom annotations for reference lines
+    annotations = [
+        dict(x=1, y=1, xref='paper', yref='y',
+             text="Balanced (1)", showarrow=False,
+             xanchor='left', yanchor='bottom', font=dict(color='gray')),
+        dict(x=1, y=1.2, xref='paper', yref='y',
+             text="Overweight (1.2)", showarrow=False,
+             xanchor='left', yanchor='bottom', font=dict(color='red')),
+        dict(x=1, y=0.8, xref='paper', yref='y',
+             text="Underweight (0.8)", showarrow=False,
+             xanchor='left', yanchor='top', font=dict(color='green')),
+        dict(x=0.5, y=-0.25, xref='paper', yref='paper',
+             text="RWR = (Risk Contribution %) / (Portfolio Weight %). Values >1 indicate risk-heavy funds.",
+             showarrow=False, font=dict(size=12))
+    ]
+    
+    fig.update_layout(
+        title="Risk-Weight Ratio (RWR) Analysis",
+        xaxis_title="Fund",
+        yaxis_title="Risk-Weight Ratio (RWR)",
+        height=500,
+        hovermode='x unified',
+        xaxis=dict(tickangle=45),
+        margin=dict(b=120),  # Increase bottom margin for annotation
+        annotations=annotations
+    )
+    
+    return fig
+
 def get_portfolio_funds():
     """Get list of funds in the current portfolio"""
     with connect_to_db() as conn:
@@ -284,6 +412,78 @@ def get_fund_categories():
         except:
             # Return empty DataFrame if table doesn't exist
             return pd.DataFrame(columns=['code', 'category'])
+
+def get_fund_category(fund_code, fund_categories):
+    """Helper function to get fund category"""
+    if fund_categories.empty:
+        return "Unknown"
+    cat = fund_categories[fund_categories['code'] == fund_code]['category']
+    return cat.values[0] if len(cat) > 0 else "Unknown"
+
+def generate_allocation_recommendations(risk_df, portfolio_funds, fund_categories):
+    """
+    Generate specific allocation recommendations based on risk contributions
+    """
+    recommendations = []
+    
+    # Sort funds by different metrics for recommendations
+    high_rc_funds = risk_df.nlargest(3, '% Risk Contribution (RC%)')
+    low_rc_funds = risk_df.nsmallest(3, '% Risk Contribution (RC%)')
+    high_rwr_funds = risk_df[risk_df['Risk-Weight Ratio (RWR)'] > 1.2]
+    low_rwr_funds = risk_df[risk_df['Risk-Weight Ratio (RWR)'] < 0.8]
+    
+    # Recommendation 1: Reduce highest risk contributors
+    if not high_rc_funds.empty:
+        rec = {
+            'type': 'Reduce High Risk Contributors',
+            'details': 'These funds contribute disproportionately to portfolio risk:',
+            'funds': []
+        }
+        for _, row in high_rc_funds.iterrows():
+            category = get_fund_category(row['Fund Code'], fund_categories)
+            rec['funds'].append({
+                'name': row['Fund Name'],
+                'rc_pct': row['% Risk Contribution (RC%)'],
+                'weight': row['Portfolio Weight (%)'],
+                'category': category
+            })
+        recommendations.append(rec)
+    
+    # Recommendation 2: Increase low risk contributors
+    if not low_rc_funds.empty:
+        rec = {
+            'type': 'Increase Low Risk Contributors',
+            'details': 'These funds provide good diversification benefits:',
+            'funds': []
+        }
+        for _, row in low_rc_funds.iterrows():
+            category = get_fund_category(row['Fund Code'], fund_categories)
+            rec['funds'].append({
+                'name': row['Fund Name'],
+                'rc_pct': row['% Risk Contribution (RC%)'],
+                'weight': row['Portfolio Weight (%)'],
+                'category': category
+            })
+        recommendations.append(rec)
+    
+    # Recommendation 3: Rebalance risk-heavy funds
+    if not high_rwr_funds.empty:
+        rec = {
+            'type': 'Rebalance Risk-Heavy Funds',
+            'details': 'These funds are contributing more risk than their allocation:',
+            'funds': []
+        }
+        for _, row in high_rwr_funds.iterrows():
+            category = get_fund_category(row['Fund Code'], fund_categories)
+            rec['funds'].append({
+                'name': row['Fund Name'],
+                'rwr': row['Risk-Weight Ratio (RWR)'],
+                'weight': row['Portfolio Weight (%)'],
+                'category': category
+            })
+        recommendations.append(rec)
+    
+    return recommendations
 
 def provide_allocation_recommendations(analysis, portfolio_funds, fund_categories):
     """
@@ -503,13 +703,14 @@ def main():
         analysis = analyze_correlation_patterns(corr_matrix)
         recommendations = provide_allocation_recommendations(analysis, portfolio_funds, fund_categories)
         risk_df = calculate_risk_contributions(corr_matrix, returns_data, portfolio_funds)
+        allocation_recs = generate_allocation_recommendations(risk_df, portfolio_funds, fund_categories)
     
     # Display results based on selected analysis type
     if analysis_type in ['Risk Contribution Analysis', 'Both']:
         st.subheader("📊 Risk Contribution Analysis")
         
         # Create columns for metrics
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
             total_benefit = risk_df['Diversification Benefit (%)'].sum()
@@ -527,11 +728,35 @@ def main():
             {max_risk_fund}
             </div>
             """, unsafe_allow_html=True)
-            #st.metric("Highest Risk Contributor", f"{max_risk_fund[:15]}...")
+        
+        with col4:
+            score = risk_df.attrs.get('diversification_score', 0)
+            weighted_corr = risk_df.attrs.get('weighted_avg_correlation', 0)
+            portfolio_vol = risk_df.attrs.get('portfolio_volatility', 0)
+            
+            # Color based on score (red < 0.3, yellow < 0.6, green >= 0.6)
+            if score < 0.3:
+                delta_color = "inverse"
+            elif score < 0.6:
+                delta_color = "off"
+            else:
+                delta_color = "normal"
+            
+            st.metric(
+                "Diversification Score", 
+                f"{score:.2f}",
+                help=f"1 - Weighted Avg Correlation ({weighted_corr:.2f}). Higher = better diversification"
+            )
         
         # Display risk contribution chart
         st.plotly_chart(
             plot_risk_contributions(risk_df),
+            use_container_width=True
+        )
+        
+        # Display Risk-Weight Ratio plot
+        st.plotly_chart(
+            plot_risk_weight_ratio(risk_df),
             use_container_width=True
         )
         
@@ -548,10 +773,24 @@ def main():
             - **Diversified Risk (Blue)**: Actual risk contribution after accounting for correlations
             - **Diversification Benefit (Green)**: Risk reduction from diversification
             
-            Key Insights:
-            - Funds with large green segments are providing good diversification
-            - Funds with large red segments are major risk contributors
-            - Negative correlation funds will show larger green segments
+            **Key Metrics:**
+            
+            - **Marginal Risk Contribution (MRC)**: How much portfolio risk changes with a small increase in this fund's weight
+            - **% Risk Contribution (RC%)**: This fund's contribution to total portfolio risk
+            - **Risk-Weight Ratio (RWR)**: Ratio of risk contribution to portfolio weight
+            - **Diversification Score**: Overall portfolio diversification quality (0-1 scale)
+            
+            **Interpretation Guidelines:**
+            
+            - **RWR > 1.2** 🔴: Fund is overweight in risk (consider reducing allocation)
+            - **RWR 0.8-1.2** 🔵: Balanced risk contribution
+            - **RWR < 0.8** 🟢: Fund is providing good diversification
+            - **Diversification Score:**
+              - **0.8-1.0**: Excellent
+              - **0.6-0.8**: Good
+              - **0.4-0.6**: Moderate
+              - **0.2-0.4**: Low
+              - **0.0-0.2**: Very poor
             """)
     
     if analysis_type in ['Rolling Correlation Over Time', 'Both']:
@@ -616,7 +855,7 @@ def main():
     st.subheader("🎯 Correlation Analysis & Recommendations")
     
     # Show key metrics
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.metric("Average Correlation", f"{analysis['average_correlation']:.3f}")
@@ -627,7 +866,58 @@ def main():
     with col3:
         st.metric("Negative Correlation Pairs", len(analysis['negative_correlation']))
     
-    # Display recommendations
+    with col4:
+        st.metric("Portfolio Volatility", f"{risk_df.attrs.get('portfolio_volatility', 0):.4f}")
+    
+    # Display specific allocation recommendations
+    st.subheader("📌 Specific Allocation Recommendations")
+    
+    for rec in allocation_recs:
+        with st.expander(f"{'🔴' if 'Reduce' in rec['type'] else '🟢'} {rec['type']}"):
+            st.write(rec['details'])
+            
+            for fund in rec['funds']:
+                if rec['type'] == 'Reduce High Risk Contributors':
+                    st.write(f"- **{fund['name']}** (Category: {fund['category']})")
+                    st.write(f"  - Current Weight: {fund['weight']:.1f}%")
+                    st.write(f"  - Risk Contribution: {fund['rc_pct']:.1f}%")
+                    st.write(f"  → Consider reducing allocation by 5-10%")
+                    st.write(f"  → Potential replacement: Look for lower-correlation funds in same category")
+                
+                elif rec['type'] == 'Increase Low Risk Contributors':
+                    st.write(f"- **{fund['name']}** (Category: {fund['category']})")
+                    st.write(f"  - Current Weight: {fund['weight']:.1f}%")
+                    st.write(f"  - Risk Contribution: {fund['rc_pct']:.1f}%")
+                    st.write(f"  → Consider increasing allocation by 5-10%")
+                    st.write(f"  → Good candidate for additional investments")
+                
+                elif rec['type'] == 'Rebalance Risk-Heavy Funds':
+                    st.write(f"- **{fund['name']}** (Category: {fund['category']})")
+                    st.write(f"  - Current Weight: {fund['weight']:.1f}%")
+                    st.write(f"  - Risk-Weight Ratio: {fund['rwr']:.2f}")
+                    st.write(f"  → Consider reducing allocation to balance risk contribution")
+                    st.write(f"  → Rebalance proceeds to funds with RWR < 0.8")
+            
+            if rec['type'] == 'Reduce High Risk Contributors':
+                st.write("\n**Action Plan:**")
+                st.write("1. Identify lower-correlation alternatives for these funds")
+                st.write("2. Gradually reduce allocations (5-10% per rebalance)")
+                st.write("3. Monitor impact on portfolio volatility")
+            
+            elif rec['type'] == 'Increase Low Risk Contributors':
+                st.write("\n**Action Plan:**")
+                st.write("1. Prioritize these funds for new investments")
+                st.write("2. Consider modest increases in allocation (5-10%)")
+                st.write("3. Verify they maintain their diversification characteristics")
+            
+            elif rec['type'] == 'Rebalance Risk-Heavy Funds':
+                st.write("\n**Action Plan:**")
+                st.write("1. Reduce allocations to these funds")
+                st.write("2. Rebalance proceeds to funds with RWR < 0.8")
+                st.write("3. Aim for more balanced risk contributions")
+    
+    # Display correlation-based recommendations
+    st.subheader("🔍 Correlation-Based Recommendations")
     for rec in recommendations:
         with st.expander(f"💡 {rec['type']}"):
             st.write(rec['details'])
@@ -643,13 +933,18 @@ def main():
     
     # Additional insights section
     with st.expander("📊 Additional Insights"):
-        st.write("**Understanding Rolling Correlations:**")
+        st.write("**Understanding Risk Contributions:**")
+        st.write("- **High RC% Funds**: Contribute disproportionately to portfolio risk - consider reducing")
+        st.write("- **Low RC% Funds**: Provide diversification - consider increasing")
+        st.write("- **Negative Correlation**: Excellent for risk reduction")
+        
+        st.write("\n**Understanding Rolling Correlations:**")
         st.write("- **High correlation (>0.7)**: Funds move very similarly - consider reducing overlap")
         st.write("- **Moderate correlation (0.3-0.7)**: Some similarity but still providing diversification")  
         st.write("- **Low correlation (<0.3)**: Good diversification benefits")
         st.write("- **Negative correlation (<0)**: Excellent for risk reduction")
-        st.write("")
-        st.write("**Time-varying correlations can indicate:**")
+        
+        st.write("\n**Time-varying correlations can indicate:**")
         st.write("- Market stress periods (correlations often increase)")
         st.write("- Sector rotation effects")
         st.write("- Fund manager style changes")
