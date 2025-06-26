@@ -552,7 +552,7 @@ def main():
 
                 # Merge with holdings data
                 holdings = holdings.merge(
-                     investment_types,
+                    investment_types,
                     left_on='code',
                     right_on='scheme_code',
                     how='left'
@@ -567,7 +567,8 @@ def main():
                 holdings['scheme_category'] = 'Other'
                 holdings['scheme_type'] = 'Other'
 
-            # Fill any missing categories with 'Other'
+            # Fill any missing values
+            holdings['investment_type'] = holdings['investment_type'].fillna('Other')
             holdings['scheme_category'] = holdings['scheme_category'].fillna('Other')
             holdings['scheme_type'] = holdings['scheme_type'].fillna('Other')
             
